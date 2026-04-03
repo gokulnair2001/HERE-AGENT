@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""
+RAG Agent for HERE SDK documentation.
+
+Commands:
+  ingest  - Load .md files, chunk, embed, and store in ChromaDB (run once)
+  query   - Ask questions against the knowledge base
+  chat    - Interactive chat loop (single-shot retrieval)
+  agent   - Interactive agent with tool calling (LLM decides what to search/read)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import textwrap
+import shutil
+from pathlib import Path
+
+REQUIRED_PACKAGES = [
+    "langchain-community", "langchain-text-splitters", "chromadb",
+    "sentence-transformers", "groq", "rich", "python-dotenv",
+]
+
+
+def _ensure_deps():
+    """Auto-install missing dependencies."""
+    try:
+        from langchain_community.document_loaders import DirectoryLoader, TextLoader
+        from langchain_community.vectorstores import Chroma
+        from groq import Groq
+        from rich.console import Console
+    except ImportError:
+        print("Installing dependencies (one-time)...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
+            stdout=subprocess.DEVNULL,
+        )
+
+_ensure_deps()
+
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from groq import Groq
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
+from rich.theme import Theme
+from rich.prompt import Prompt
+from dotenv import load_dotenv
+
+load_dotenv()
+
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "success": "bold green",
+    "source": "dim italic",
+    "user_prompt": "bold bright_green",
+})
+console = Console(theme=custom_theme)
+
+DEFAULT_VECTORDB_DIR = "./vectordb"
+DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_TOP_K = 8
+
+SYSTEM_PROMPT = """\
+You are a technical assistant for the HERE SDK for iOS (Navigate Edition, v4.25.5.0).
+
+STRICT RULES:
+1. Answer ONLY based on the provided context. Do NOT use prior knowledge about the HERE SDK.
+2. If the context does not contain the answer, respond with: "I don't have enough information in the documentation to answer this. The relevant docs may not be indexed, or try rephrasing your question."
+3. Always cite the exact class, method, or property names as they appear in the context.
+4. Do NOT invent method signatures, parameters, or return types. If a signature is partially visible, say so.
+5. When referencing a class, include [SourceFile] attribution.
+
+{skill_instructions}
+
+Context (each block is prefixed with [SourceFile]):
+{context}
+
+Question: {question}
+
+Answer (cite sources, refuse if context is insufficient):"""
+
+# ---------------------------------------------------------------------------
+# Skills — auto-detected from the user's question
+# ---------------------------------------------------------------------------
+
+SKILLS = {
+    "code": {
+        "keywords": ["code", "example", "snippet", "implement", "how to", "show me", "write", "sample", "usage", "swift", "objective-c"],
+        "instructions": (
+            "SKILL: Code Generation\n"
+            "- Provide a working Swift code example that directly answers the question.\n"
+            "- Include necessary imports.\n"
+            "- Add brief inline comments explaining key lines.\n"
+            "- If the context shows method signatures, use them exactly.\n"
+            "- Wrap code in ```swift fenced blocks."
+        ),
+    },
+    "compare": {
+        "keywords": ["compare", "difference", "vs", "versus", "differ", "which one", "better", "alternative", "instead of"],
+        "instructions": (
+            "SKILL: API Comparison\n"
+            "- Present a clear side-by-side comparison using a Markdown table.\n"
+            "- Columns: Feature | Class/Method A | Class/Method B\n"
+            "- Highlight key differences in purpose, parameters, and return types.\n"
+            "- End with a short recommendation on when to use each."
+        ),
+    },
+    "troubleshoot": {
+        "keywords": ["error", "crash", "fail", "issue", "bug", "problem", "not working", "exception", "nil", "null", "debug", "fix", "wrong"],
+        "instructions": (
+            "SKILL: Troubleshooting\n"
+            "- Start with the most likely cause of the issue.\n"
+            "- List possible causes as numbered steps, ordered by likelihood.\n"
+            "- For each cause, provide a concrete fix with code if applicable.\n"
+            "- Mention any known gotchas or prerequisites (e.g., permissions, initialization order).\n"
+            "- If the context is insufficient, list what information would be needed to diagnose further."
+        ),
+    },
+    "tutorial": {
+        "keywords": ["tutorial", "guide", "walkthrough", "step by step", "steps", "setup", "get started", "integrate", "configure", "build"],
+        "instructions": (
+            "SKILL: Tutorial / Step-by-Step Guide\n"
+            "- Break the answer into numbered steps.\n"
+            "- Each step should have a short heading and explanation.\n"
+            "- Include Swift code snippets where relevant.\n"
+            "- Note any prerequisites at the top (imports, permissions, setup).\n"
+            "- End with a 'What's Next' suggestion if applicable."
+        ),
+    },
+}
+
+DEFAULT_SKILL_INSTRUCTIONS = (
+    "Provide a clear, well-structured answer. "
+    "Use Markdown formatting: headings, bullet points, code blocks where appropriate."
+)
+
+
+def detect_skill(question: str) -> str:
+    """Detect which skill to apply based on keywords in the question."""
+    q = question.lower()
+    best_skill = None
+    best_count = 0
+    for skill_name, skill in SKILLS.items():
+        count = sum(1 for kw in skill["keywords"] if kw in q)
+        if count > best_count:
+            best_count = count
+            best_skill = skill_name
+    return best_skill
+
+
+QUERY_EXPANSION_PROMPT = """\
+You are a search query optimizer for HERE SDK iOS API documentation.
+
+Given a user question, generate 2-3 short search queries that would find the relevant API classes, methods, or properties. Think about:
+- What class names are likely relevant (e.g., "show a map" → MapView, MapScene)
+- What method or property names might exist
+- Related classes the user might need
+
+User question: {question}
+
+Return ONLY the search queries, one per line. No explanations."""
+
+
+def expand_query(question: str, api_key: str, groq_model: str) -> list[str]:
+    """Use the LLM to generate better search queries from a natural language question."""
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=groq_model,
+        messages=[{"role": "user", "content": QUERY_EXPANSION_PROMPT.format(question=question)}],
+        temperature=0.0,
+        max_tokens=150,
+    )
+    lines = [l.strip() for l in response.choices[0].message.content.strip().split("\n") if l.strip()]
+    return lines
+
+
+def get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={"device": "cpu"},
+    )
+
+
+def ingest(md_dir: str, vectordb_dir: str, embed_model: str, fresh: bool = False) -> None:
+    """Load .md files, chunk them, embed, and store in ChromaDB."""
+    if fresh and Path(vectordb_dir).exists():
+        import shutil as _shutil
+        _shutil.rmtree(vectordb_dir)
+        console.print(f"[warning]Deleted existing vector DB at {vectordb_dir}[/warning]")
+
+    md_path = Path(md_dir)
+    if not md_path.is_dir():
+        sys.exit(f"Directory not found: {md_path}")
+
+    md_files = sorted(md_path.glob("*.md"))
+    if not md_files:
+        sys.exit(f"No .md files found in: {md_path}")
+
+    console.print(f"[info]Loading {len(md_files)} .md file(s) from {md_path}...[/info]")
+
+    # Load all .md files
+    loader = DirectoryLoader(
+        str(md_path), glob="*.md", loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"},
+    )
+    docs = loader.load()
+    console.print(f"[info]Loaded {len(docs)} document(s)[/info]")
+
+    # Split by markdown headers first, then by size
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[
+            ("#", "h1"),
+            ("##", "h2"),
+            ("###", "h3"),
+        ]
+    )
+
+    # Further split large chunks by character count
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    all_chunks = []
+    for doc in docs:
+        source_file = Path(doc.metadata.get("source", "unknown"))
+        class_name = source_file.stem  # e.g., "MapView" from "MapView.md"
+
+        # Split by headers
+        header_chunks = header_splitter.split_text(doc.page_content)
+        for chunk in header_chunks:
+            # Carry source metadata
+            chunk.metadata["source"] = doc.metadata.get("source", "unknown")
+            chunk.metadata["class_name"] = class_name
+        # Further split any large chunks
+        final_chunks = text_splitter.split_documents(header_chunks)
+
+        # Prepend class name to each chunk for better embedding alignment
+        for chunk in final_chunks:
+            chunk.page_content = f"[Class: {class_name}] {chunk.page_content}"
+            chunk.metadata["class_name"] = class_name
+
+        all_chunks.extend(final_chunks)
+
+    console.print(f"[info]Created {len(all_chunks)} chunk(s)[/info]")
+
+    # Embed and store
+    console.print(f"[info]Embedding with model '{embed_model}' (first run downloads the model)...[/info]")
+    embeddings = get_embeddings(embed_model)
+
+    vectorstore = Chroma.from_documents(
+        documents=all_chunks,
+        embedding=embeddings,
+        persist_directory=vectordb_dir,
+    )
+
+    console.print(f"[success]Stored {len(all_chunks)} vectors in {vectordb_dir}[/success]")
+    console.print('[success]Ingestion complete.[/success] Run: [bold]python rag_agent.py chat[/bold]')
+
+
+def get_retriever(vectordb_dir: str, embed_model: str, top_k: int):
+    """Load ChromaDB and return the vectorstore and top_k."""
+    embeddings = get_embeddings(embed_model)
+    vectorstore = Chroma(
+        persist_directory=vectordb_dir,
+        embedding_function=embeddings,
+    )
+    return vectorstore, top_k
+
+
+def retrieve_with_expansion(vectorstore, top_k: int, question: str, api_key: str, groq_model: str):
+    """Retrieve docs using the original query + LLM-expanded queries, then deduplicate."""
+    all_queries = [question]
+    try:
+        expanded = expand_query(question, api_key, groq_model)
+        all_queries.extend(expanded)
+    except Exception:
+        pass  # Fall back to original query only
+
+    seen_contents = set()
+    unique_docs = []
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
+
+    for q in all_queries:
+        docs = retriever.invoke(q)
+        for doc in docs:
+            content_hash = hash(doc.page_content)
+            if content_hash not in seen_contents:
+                seen_contents.add(content_hash)
+                unique_docs.append(doc)
+
+    # Limit total context to avoid token overflow
+    return unique_docs[:top_k + 4]
+
+
+def rerank_docs(docs, question: str):
+    """Lightweight keyword reranking — boost docs that share words with the question."""
+    q_words = set(question.lower().split())
+
+    def score(doc):
+        content_words = set(doc.page_content.lower().split())
+        class_name = doc.metadata.get("class_name", "").lower()
+        # Exact class name match in question is a strong signal
+        class_bonus = 5 if class_name and class_name in question.lower() else 0
+        return len(q_words & content_words) + class_bonus
+
+    return sorted(docs, key=score, reverse=True)
+
+
+def ask_groq(question: str, context_docs, groq_model: str, api_key: str):
+    """Send question + retrieved context to Groq and return the answer."""
+    context_parts = []
+    for doc in context_docs:
+        source = Path(doc.metadata.get("source", "unknown")).stem
+        context_parts.append(f"[{source}]\n{doc.page_content}")
+    context = "\n---\n".join(context_parts)
+
+    # Detect and apply skill
+    skill_name = detect_skill(question)
+    if skill_name:
+        skill_instructions = SKILLS[skill_name]["instructions"]
+    else:
+        skill_instructions = DEFAULT_SKILL_INSTRUCTIONS
+
+    prompt = SYSTEM_PROMPT.format(
+        context=context,
+        question=question,
+        skill_instructions=skill_instructions,
+    )
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=groq_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content, skill_name
+
+
+SKILL_LABELS = {
+    "code": "\U0001f4bb Code Generation",
+    "compare": "\u2696\ufe0f  API Comparison",
+    "troubleshoot": "\U0001f527 Troubleshooting",
+    "tutorial": "\U0001f4d6 Tutorial",
+}
+
+
+def print_answer(answer: str, docs, skill_name: str = None) -> None:
+    """Render the answer as formatted markdown with source citations."""
+    title = "[bold bright_white]Answer[/bold bright_white]"
+    if skill_name and skill_name in SKILL_LABELS:
+        title += f"  [dim]({SKILL_LABELS[skill_name]})[/dim]"
+
+    console.print()
+    console.print(Panel(
+        Markdown(answer),
+        title=title,
+        border_style="bright_cyan",
+        padding=(1, 2),
+    ))
+
+    if docs:
+        seen = set()
+        sources = []
+        for doc in docs:
+            source = doc.metadata.get("source", "unknown")
+            if source not in seen:
+                seen.add(source)
+                sources.append(Path(source).stem)
+        source_text = "  ".join(f"[source]• {s}[/source]" for s in sources)
+        console.print(f"  [dim]Sources:[/dim] {source_text}")
+    console.print()
+
+
+def query(question: str, vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_key: str) -> None:
+    """Ask a single question."""
+    if not Path(vectordb_dir).is_dir():
+        sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
+
+    vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
+    docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, groq_model)
+    docs = rerank_docs(docs, question)
+    answer, skill_name = ask_groq(question, docs, groq_model, api_key)
+    print_answer(answer, docs, skill_name)
+
+
+def chat(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_key: str) -> None:
+    """Interactive chat loop."""
+    if not Path(vectordb_dir).is_dir():
+        sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
+
+    console.print("[info]Loading knowledge base...[/info]")
+    vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
+
+    console.print()
+    console.print(Panel(
+        f"[bold]HERE SDK Documentation Agent[/bold]\n\n"
+        f"Model: [cyan]{groq_model}[/cyan] via Groq\n\n"
+        f"[bold]Skills[/bold] (auto-detected from your question):\n"
+        f"  \U0001f4bb [bold]Code Generation[/bold]  — \"Show me how to...\", \"example of...\"\n"
+        f"  \u2696\ufe0f  [bold]API Comparison[/bold]   — \"Compare X vs Y\", \"difference between...\"\n"
+        f"  \U0001f527 [bold]Troubleshooting[/bold]  — \"Error with...\", \"not working...\"\n"
+        f"  \U0001f4d6 [bold]Tutorial[/bold]         — \"Step by step...\", \"how to set up...\"\n\n"
+        f"Type your question and press Enter.\n"
+        f"Commands: [bold]quit[/bold] / [bold]exit[/bold] / [bold]q[/bold] to leave.",
+        border_style="bright_green",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    while True:
+        try:
+            question = Prompt.ask("[user_prompt]You[/user_prompt]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[warning]Bye![/warning]")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("quit", "exit", "q"):
+            console.print("[warning]Bye![/warning]")
+            break
+
+        with console.status("[info]Thinking...[/info]", spinner="dots"):
+            docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, groq_model)
+            docs = rerank_docs(docs, question)
+            answer, skill_name = ask_groq(question, docs, groq_model, api_key)
+
+        print_answer(answer, docs, skill_name)
+
+
+# ---------------------------------------------------------------------------
+# Agent mode — LLM decides which tools to call in a loop
+# ---------------------------------------------------------------------------
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": "Semantic search over the HERE SDK documentation. Returns the most relevant chunks for a query. Use this to find classes, methods, properties, or concepts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — can be a class name, method name, concept, or natural language question.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_class_doc",
+            "description": "Read the full documentation for a specific class. Use this when you need complete details about a class (all methods, properties, inheritance). The class_name should match a known class exactly (e.g., 'MapView', 'Route', 'SearchEngine').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "class_name": {
+                        "type": "string",
+                        "description": "Exact class name, e.g., 'MapView', 'Navigator', 'RoutingEngine'.",
+                    }
+                },
+                "required": ["class_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_classes",
+            "description": "List all available documented classes/types in the HERE SDK. Use this to discover what's available or find the correct class name.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+AGENT_SYSTEM_PROMPT = """\
+You are a technical assistant for the HERE SDK for iOS (Navigate Edition, v4.25.5.0).
+
+You have tools to search and read the SDK documentation. Use them to research the answer before responding.
+
+WORKFLOW:
+1. Think about what documentation you need to answer the question.
+2. Use search_docs to find relevant chunks, or list_classes to discover available classes.
+3. Use read_class_doc to get full details on specific classes when needed.
+4. You may call tools multiple times to gather enough context.
+5. Once you have sufficient information, provide your final answer.
+
+RULES:
+- Base your answer ONLY on information from the tools. Do NOT use prior knowledge about the HERE SDK.
+- If the tools don't return relevant information, say so clearly.
+- Always cite exact class, method, or property names as they appear in the docs.
+- Do NOT invent method signatures, parameters, or return types."""
+
+MAX_AGENT_STEPS = 8
+MAX_CLASS_DOC_LENGTH = 6000  # chars, to avoid blowing up context
+
+
+def tool_search_docs(vectorstore, top_k: int, query: str) -> str:
+    """Execute search_docs tool."""
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
+    docs = retriever.invoke(query)
+    if not docs:
+        return "No results found."
+    parts = []
+    for doc in docs:
+        source = Path(doc.metadata.get("source", "unknown")).stem
+        parts.append(f"[{source}]\n{doc.page_content}")
+    return "\n---\n".join(parts)
+
+
+def tool_read_class_doc(md_dir: str, class_name: str) -> str:
+    """Execute read_class_doc tool."""
+    md_path = Path(md_dir) / f"{class_name}.md"
+    if not md_path.exists():
+        # Try case-insensitive match
+        for f in Path(md_dir).glob("*.md"):
+            if f.stem.lower() == class_name.lower():
+                md_path = f
+                break
+        else:
+            return f"No documentation found for '{class_name}'. Use list_classes to see available classes."
+    content = md_path.read_text(encoding="utf-8")
+    if len(content) > MAX_CLASS_DOC_LENGTH:
+        content = content[:MAX_CLASS_DOC_LENGTH] + f"\n\n... [truncated, {len(content)} chars total — use search_docs for specific methods]"
+    return content
+
+
+def tool_list_classes(md_dir: str) -> str:
+    """Execute list_classes tool."""
+    classes = sorted(f.stem for f in Path(md_dir).glob("*.md") if f.stem != "index")
+    return f"{len(classes)} classes available:\n" + ", ".join(classes)
+
+
+def run_agent_turn(question: str, vectorstore, top_k: int, md_dir: str, groq_model: str, api_key: str) -> str:
+    """Run the agent loop: LLM calls tools until it produces a final answer."""
+    client = Groq(api_key=api_key)
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+
+    for step in range(MAX_AGENT_STEPS):
+        response = client.chat.completions.create(
+            model=groq_model,
+            messages=messages,
+            tools=AGENT_TOOLS,
+            tool_choice="auto",
+            temperature=0.1,
+        )
+
+        msg = response.choices[0].message
+
+        # If no tool calls, we have the final answer
+        if not msg.tool_calls:
+            return msg.content
+
+        # Process tool calls
+        messages.append(msg)
+
+        for tool_call in msg.tool_calls:
+            fn_name = tool_call.function.name
+            try:
+                fn_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            console.print(f"  [dim]→ {fn_name}({', '.join(f'{k}={v!r}' for k, v in fn_args.items())})[/dim]")
+
+            if fn_name == "search_docs":
+                result = tool_search_docs(vectorstore, top_k, fn_args.get("query", question))
+            elif fn_name == "read_class_doc":
+                result = tool_read_class_doc(md_dir, fn_args.get("class_name", ""))
+            elif fn_name == "list_classes":
+                result = tool_list_classes(md_dir)
+            else:
+                result = f"Unknown tool: {fn_name}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    # If we exhaust steps, ask for a final answer
+    messages.append({"role": "user", "content": "Please provide your final answer now based on what you've found."})
+    response = client.chat.completions.create(
+        model=groq_model,
+        messages=messages,
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+
+def agent(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_key: str, md_dir: str) -> None:
+    """Interactive agent mode with tool calling."""
+    if not Path(vectordb_dir).is_dir():
+        sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
+
+    console.print("[info]Loading knowledge base...[/info]")
+    vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
+
+    console.print()
+    console.print(Panel(
+        f"[bold]HERE SDK Agent[/bold]\n\n"
+        f"Model: [cyan]{groq_model}[/cyan] via Groq\n\n"
+        f"[bold]Tools[/bold] (the agent decides when to use them):\n"
+        f"  \U0001f50d [bold]search_docs[/bold]    — semantic search over the documentation\n"
+        f"  \U0001f4c4 [bold]read_class_doc[/bold] — read full documentation for a class\n"
+        f"  \U0001f4cb [bold]list_classes[/bold]    — list all documented classes\n\n"
+        f"The agent will research your question using these tools, then answer.\n\n"
+        f"Commands: [bold]quit[/bold] / [bold]exit[/bold] / [bold]q[/bold] to leave.",
+        border_style="bright_magenta",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    while True:
+        try:
+            question = Prompt.ask("[user_prompt]You[/user_prompt]").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[warning]Bye![/warning]")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("quit", "exit", "q"):
+            console.print("[warning]Bye![/warning]")
+            break
+
+        console.print("[info]Researching...[/info]")
+        answer = run_agent_turn(question, vectorstore, top_k, md_dir, groq_model, api_key)
+
+        console.print()
+        console.print(Panel(
+            Markdown(answer),
+            title="[bold bright_white]Answer[/bold bright_white]",
+            border_style="bright_cyan",
+            padding=(1, 2),
+        ))
+        console.print()
+
+
+def _vectordb_dir_for(md_dir: str) -> str:
+    """Derive a vectordb path from the docs directory so each doc set gets its own DB."""
+    return os.path.join(os.path.dirname(os.path.abspath(md_dir)), ".vectordb_" + Path(md_dir).name)
+
+
+def _ensure_api_key() -> str:
+    """Get the Groq API key from env or prompt the user."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        console.print("[warning]GROQ_API_KEY not found in environment.[/warning]")
+        console.print("Get a free key at: [bold]https://console.groq.com/keys[/bold]\n")
+        api_key = Prompt.ask("Paste your Groq API key").strip()
+        if not api_key:
+            sys.exit("No API key provided.")
+        os.environ["GROQ_API_KEY"] = api_key
+    return api_key
+
+
+def _auto_ingest_if_needed(md_dir: str, vectordb_dir: str, embed_model: str) -> None:
+    """Ingest docs into the vector DB if it doesn't already exist."""
+    if Path(vectordb_dir).is_dir():
+        return
+    console.print(f"[info]First run — indexing docs from {md_dir}...[/info]")
+    ingest(md_dir, vectordb_dir, embed_model, fresh=False)
+    console.print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="RAG Agent — chat with your docs",
+        usage="%(prog)s [docs_path] [options]",
+    )
+    parser.add_argument(
+        "docs_path", nargs="?", default=None,
+        help="Path to directory of .md files. Auto-ingests and starts the agent.",
+    )
+    parser.add_argument("--vectordb", default=None, help="Path to ChromaDB directory (auto-derived if omitted)")
+    parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Sentence-transformers model name")
+    parser.add_argument("--groq-model", default=DEFAULT_GROQ_MODEL, help="Groq LLM model name")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of chunks to retrieve")
+    parser.add_argument("--fresh", action="store_true", help="Re-ingest docs even if vector DB exists")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ingest
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest .md files into vector DB")
+    ingest_parser.add_argument("md_dir", nargs="?", default="docs/md", help="Directory containing .md files (default: docs/md)")
+    ingest_parser.add_argument("--fresh", action="store_true", dest="ingest_fresh", help="Delete existing vector DB before re-ingesting")
+
+    # query
+    query_parser = subparsers.add_parser("query", help="Ask a single question")
+    query_parser.add_argument("question", help="The question to ask")
+
+    # chat
+    subparsers.add_parser("chat", help="Interactive chat mode (single-shot retrieval)")
+
+    # agent
+    agent_parser = subparsers.add_parser("agent", help="Interactive agent mode with tool calling")
+    agent_parser.add_argument("--md-dir", default="docs/md", help="Directory containing .md files")
+
+    args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Quick-start mode: python rag_agent.py /path/to/docs
+    # ------------------------------------------------------------------
+    if args.docs_path and not args.command:
+        md_dir = args.docs_path
+        if not Path(md_dir).is_dir():
+            sys.exit(f"Not a directory: {md_dir}")
+
+        md_files = list(Path(md_dir).glob("*.md"))
+        if not md_files:
+            sys.exit(f"No .md files found in: {md_dir}")
+
+        vectordb_dir = args.vectordb or _vectordb_dir_for(md_dir)
+        api_key = _ensure_api_key()
+
+        if args.fresh and Path(vectordb_dir).exists():
+            shutil.rmtree(vectordb_dir)
+
+        _auto_ingest_if_needed(md_dir, vectordb_dir, args.embed_model)
+        agent(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, md_dir)
+        return
+
+    # ------------------------------------------------------------------
+    # Subcommand mode (backward-compatible)
+    # ------------------------------------------------------------------
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "ingest":
+        vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
+        ingest(args.md_dir, vectordb_dir, args.embed_model, args.ingest_fresh)
+    else:
+        api_key = _ensure_api_key()
+        vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
+        if args.command == "query":
+            query(args.question, vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key)
+        elif args.command == "chat":
+            chat(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key)
+        elif args.command == "agent":
+            _auto_ingest_if_needed(args.md_dir, vectordb_dir, args.embed_model)
+            agent(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, args.md_dir)
+
+
+if __name__ == "__main__":
+    main()

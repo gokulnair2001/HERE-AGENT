@@ -1,0 +1,7 @@
+.env
+.venv/
+vectordb/
+.vectordb_*/
+__pycache__/
+docs/html/
+docs/md/
