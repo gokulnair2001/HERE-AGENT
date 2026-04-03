@@ -208,7 +208,7 @@ console = Console(theme=custom_theme)
 
 DEFAULT_VECTORDB_DIR = "./vectordb"
 DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_TOP_K = 8
 
 SYSTEM_PROMPT = """\
