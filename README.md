@@ -1,60 +1,66 @@
-# HERE SDK RAG Agent
+# HERE Agent
 
-A local RAG agent that answers questions about the HERE SDK using your documentation.
+A single-file CLI agent that lets you chat with any documentation (HTML or Markdown) using Groq + ChromaDB. One command does everything: installs deps, converts HTML, indexes docs, starts an interactive agent.
 
-## Quick Start (for team members)
-
-1. Drop your HTML documentation files into `docs/html/`
-2. Add your Groq API key to `.env`:
-   ```
-   GROQ_API_KEY=gsk_your_key_here
-   ```
-   Get a free key at https://console.groq.com/keys
-3. Run the setup script:
-   ```bash
-   ./setup.sh
-   ```
-4. Start chatting:
-   ```bash
-   source .venv/bin/activate
-   python rag_agent.py chat
-   ```
-
-That's it. The setup script handles everything: venv, dependencies, HTML→Markdown conversion, and vector DB creation.
-
-## Folder Structure
-
-```
-HERE Aent KB/
-├── docs/
-│   ├── html/          ← Drop HTML files here
-│   └── md/            ← Auto-generated Markdown
-├── vectordb/          ← Auto-generated vector store
-├── html_to_md.py      ← HTML → Markdown converter
-├── rag_agent.py       ← RAG pipeline (ingest, query, chat)
-├── setup.sh           ← One-command setup
-├── .env               ← Groq API key (not committed)
-└── README.md
-```
-
-## Commands
+## Quick Start
 
 ```bash
-# Interactive chat
-python rag_agent.py chat
-
-# Single question
-python rag_agent.py query "How do I use MapView?"
-
-# Re-ingest after updating docs (deletes old vector DB)
-python rag_agent.py ingest --fresh
-
-# Convert HTML manually
-python html_to_md.py docs/html -o docs/md
+curl -O https://raw.githubusercontent.com/gokulnair2001/HERE-AGENT/main/rag_agent.py
+python3 rag_agent.py /path/to/your/docs
 ```
 
-## Updating Documentation
+Point it at a folder of `.html` or `.md` files. On first run it:
+1. Installs missing Python packages
+2. Converts HTML to Markdown (if the folder contains `.html` files)
+3. Prompts for your Groq API key (free at https://console.groq.com/keys)
+4. Indexes your docs into a local vector DB
+5. Starts an interactive agent with search, read, and list tools
 
-When docs change:
-1. Replace HTML files in `docs/html/`
-2. Re-run `./setup.sh` (or `python rag_agent.py ingest --fresh`)
+Subsequent runs skip steps 1–4 and go straight to chat.
+
+## Usage
+
+```bash
+# HTML docs — auto-converted to Markdown
+python3 rag_agent.py /path/to/html/docs
+
+# Markdown docs — used directly
+python3 rag_agent.py /path/to/md/docs
+
+# Force re-index after docs change
+python3 rag_agent.py /path/to/docs --fresh
+
+# Set API key via env to skip the prompt
+export GROQ_API_KEY=gsk_your_key_here
+python3 rag_agent.py /path/to/docs
+```
+
+### Subcommands (advanced)
+
+```bash
+# Ingest docs into vector DB manually
+python3 rag_agent.py ingest docs/md --fresh
+
+# Single question
+python3 rag_agent.py query "How do I use MapView?"
+
+# Simple chat (single-shot retrieval, no tool calling)
+python3 rag_agent.py chat
+
+# Agent mode (tool calling, multi-step reasoning)
+python3 rag_agent.py agent --md-dir docs/md
+```
+
+## How It Works
+
+The agent has 3 tools it can use autonomously:
+- **search_docs** — semantic search over the vector DB
+- **read_class_doc** — reads a full `.md` file for a specific class
+- **list_classes** — lists all documented classes
+
+It decides which tools to call (up to 8 steps), gathers context, then answers grounded in the docs.
+
+## Requirements
+
+- Python 3.10+
+- Groq API key (free tier works)

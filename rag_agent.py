@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-RAG Agent for HERE SDK documentation.
+RAG Agent — chat with your docs.
 
-Commands:
-  ingest  - Load .md files, chunk, embed, and store in ChromaDB (run once)
-  query   - Ask questions against the knowledge base
-  chat    - Interactive chat loop (single-shot retrieval)
-  agent   - Interactive agent with tool calling (LLM decides what to search/read)
+Single-file CLI that converts HTML to Markdown (if needed), indexes docs,
+and starts an interactive agent with tool calling.
+
+Usage:
+  python rag_agent.py /path/to/html-or-md-docs
 """
 
 import argparse
@@ -21,6 +21,7 @@ from pathlib import Path
 REQUIRED_PACKAGES = [
     "langchain-community", "langchain-text-splitters", "chromadb",
     "sentence-transformers", "groq", "rich", "python-dotenv",
+    "beautifulsoup4", "markdownify",
 ]
 
 
@@ -52,8 +53,104 @@ from rich.text import Text
 from rich.theme import Theme
 from rich.prompt import Prompt
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup, Comment
+from markdownify import markdownify as md_convert
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# HTML → Markdown conversion
+# ---------------------------------------------------------------------------
+
+_NOISE_TAGS = [
+    "script", "style", "nav", "footer", "header", "aside", "iframe",
+    "noscript", "svg", "form", "button", "input", "select", "textarea",
+    "link", "meta", "object", "embed", "applet",
+]
+
+_NOISE_CLASSES = [
+    "sidebar", "menu", "nav", "navbar", "footer", "header", "ads", "ad",
+    "advertisement", "banner", "popup", "modal", "cookie", "social",
+    "share", "comment", "comments", "related", "recommended", "widget",
+    "breadcrumb", "pagination",
+]
+
+_NOISE_IDS = [
+    "sidebar", "menu", "nav", "navbar", "footer", "header", "ads", "ad",
+    "banner", "popup", "modal", "cookie", "comments", "related", "widget",
+]
+
+
+def _remove_noise(soup: BeautifulSoup) -> BeautifulSoup:
+    for tag_name in _NOISE_TAGS:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+    for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        comment.extract()
+    for cls in _NOISE_CLASSES:
+        for tag in soup.find_all(class_=lambda c: c and cls in " ".join(c).lower()):
+            tag.decompose()
+    for id_pattern in _NOISE_IDS:
+        for tag in soup.find_all(id=lambda i: i and id_pattern in i.lower()):
+            tag.decompose()
+    for tag in soup.find_all(style=lambda s: s and "display:none" in s.replace(" ", "").lower()):
+        tag.decompose()
+    for tag in soup.find_all(attrs={"hidden": True}):
+        tag.decompose()
+    for tag in soup.find_all(attrs={"aria-hidden": "true"}):
+        tag.decompose()
+    return soup
+
+
+def _extract_content(soup: BeautifulSoup) -> str:
+    for selector in ["main", "article", '[role="main"]', "#content", ".content", "#main", ".main"]:
+        content = soup.select_one(selector)
+        if content:
+            return str(content)
+    body = soup.find("body")
+    return str(body) if body else str(soup)
+
+
+def _html_to_markdown(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    soup = _remove_noise(soup)
+    content_html = _extract_content(soup)
+    markdown = md_convert(
+        content_html, heading_style="ATX", bullets="-",
+        strip=["img"], newline_style="backslash",
+    )
+    lines = markdown.splitlines()
+    cleaned, blank_count = [], 0
+    for line in lines:
+        if line.strip() == "":
+            blank_count += 1
+            if blank_count <= 2:
+                cleaned.append("")
+        else:
+            blank_count = 0
+            cleaned.append(line)
+    return "\n".join(cleaned).strip() + "\n"
+
+
+def convert_html_to_md(html_dir: str, md_dir: str) -> str:
+    """Convert all .html files in html_dir to .md files in md_dir. Returns md_dir path."""
+    html_path = Path(html_dir)
+    out_path = Path(md_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    html_files = sorted(html_path.rglob("*.html"))
+    if not html_files:
+        sys.exit(f"No .html files found in: {html_path}")
+
+    console.print(f"[info]Converting {len(html_files)} HTML file(s) to Markdown...[/info]")
+    for html_file in html_files:
+        html = html_file.read_text(encoding="utf-8", errors="replace")
+        markdown = _html_to_markdown(html)
+        out_file = out_path / html_file.with_suffix(".md").name
+        out_file.write_text(markdown, encoding="utf-8")
+
+    console.print(f"[success]Converted {len(html_files)} files → {out_path}[/success]")
+    return str(out_path)
 
 custom_theme = Theme({
     "info": "cyan",
@@ -692,7 +789,7 @@ def main():
     )
     parser.add_argument(
         "docs_path", nargs="?", default=None,
-        help="Path to directory of .md files. Auto-ingests and starts the agent.",
+        help="Path to directory of .html or .md files. HTML is auto-converted to Markdown.",
     )
     parser.add_argument("--vectordb", default=None, help="Path to ChromaDB directory (auto-derived if omitted)")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Sentence-transformers model name")
@@ -724,13 +821,22 @@ def main():
     # Quick-start mode: python rag_agent.py /path/to/docs
     # ------------------------------------------------------------------
     if args.docs_path and not args.command:
-        md_dir = args.docs_path
-        if not Path(md_dir).is_dir():
-            sys.exit(f"Not a directory: {md_dir}")
+        docs_path = Path(args.docs_path)
+        if not docs_path.is_dir():
+            sys.exit(f"Not a directory: {docs_path}")
 
-        md_files = list(Path(md_dir).glob("*.md"))
-        if not md_files:
-            sys.exit(f"No .md files found in: {md_dir}")
+        # Auto-detect: HTML or Markdown?
+        html_files = list(docs_path.rglob("*.html"))
+        md_files = list(docs_path.glob("*.md"))
+
+        if html_files and not md_files:
+            # HTML docs — convert to MD first
+            md_dir = str(docs_path.parent / (docs_path.name + "_md"))
+            convert_html_to_md(str(docs_path), md_dir)
+        elif md_files:
+            md_dir = str(docs_path)
+        else:
+            sys.exit(f"No .html or .md files found in: {docs_path}")
 
         vectordb_dir = args.vectordb or _vectordb_dir_for(md_dir)
         api_key = _ensure_api_key()
