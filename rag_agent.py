@@ -211,6 +211,34 @@ DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_TOP_K = 8
 
+AVAILABLE_MODELS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+]
+
+
+def _pick_model(default: str = DEFAULT_GROQ_MODEL) -> str:
+    """Interactive model picker shown at startup."""
+    console.print("[bold]Select a model:[/bold]")
+    for i, model in enumerate(AVAILABLE_MODELS, 1):
+        marker = " [dim](default)[/dim]" if model == default else ""
+        console.print(f"  [cyan]{i}[/cyan]. {model}{marker}")
+    choice = Prompt.ask(
+        "Enter number or model name",
+        default=str(AVAILABLE_MODELS.index(default) + 1) if default in AVAILABLE_MODELS else "1",
+    ).strip()
+    # Accept a number
+    if choice.isdigit() and 1 <= int(choice) <= len(AVAILABLE_MODELS):
+        selected = AVAILABLE_MODELS[int(choice) - 1]
+    # Accept a name (exact or substring)
+    elif choice in AVAILABLE_MODELS:
+        selected = choice
+    else:
+        matches = [m for m in AVAILABLE_MODELS if choice.lower() in m.lower()]
+        selected = matches[0] if matches else default
+    console.print(f"Using model: [cyan]{selected}[/cyan]\n")
+    return selected
+
 SYSTEM_PROMPT = """\
 You are a technical assistant for the HERE SDK for iOS (Navigate Edition, v4.25.5.0).
 
@@ -543,8 +571,10 @@ def chat(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_k
 
     console.print("[info]Loading knowledge base...[/info]")
     vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
-
     console.print()
+
+    groq_model = _pick_model(groq_model)
+
     console.print(Panel(
         f"[bold]HERE SDK Documentation Agent[/bold]\n\n"
         f"Model: [cyan]{groq_model}[/cyan] via Groq\n\n"
@@ -848,8 +878,10 @@ def agent(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_
 
     console.print("[info]Loading knowledge base...[/info]")
     vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
-
     console.print()
+
+    groq_model = _pick_model(groq_model)
+
     console.print(Panel(
         f"[bold]HERE SDK Agent[/bold]\n\n"
         f"Model: [cyan]{groq_model}[/cyan] via Groq\n\n"
