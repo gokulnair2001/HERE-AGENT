@@ -16,7 +16,10 @@ import subprocess
 import sys
 import textwrap
 import shutil
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", message=".*Pydantic V1.*")
 
 REQUIRED_PACKAGES = [
     "langchain-community", "langchain-text-splitters", "chromadb",
@@ -53,35 +56,8 @@ def _bootstrap_venv():
     os.execv(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:])
 
 
-def _ensure_deps():
-    """Auto-install missing dependencies, creating a venv if needed."""
-    try:
-        from langchain_community.document_loaders import DirectoryLoader, TextLoader
-        from langchain_community.vectorstores import Chroma
-        from groq import Groq
-        from rich.console import Console
-    except ImportError:
-        if _in_hsa_venv():
-            # Already in venv but deps missing — just pip install
-            print("Installing dependencies...")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
-                stdout=subprocess.DEVNULL,
-            )
-        else:
-            # Not in venv — bootstrap one and re-exec
-            _bootstrap_venv()
-            # _bootstrap_venv calls os.execv, so we never reach here
-
-
-# Handle --install before loading heavy deps (works from system python)
-if "--install" in sys.argv:
-    if not _in_hsa_venv():
-        _bootstrap_venv()  # re-execs into venv, never returns
-    # Now in venv — ensure deps are installed, then let main() handle --install
-    _ensure_deps()
-    _INSTALL_REQUESTED = True
-elif "--uninstall" in sys.argv:
+# --- Bootstrap: handle --uninstall early (no deps needed) ---
+if "--uninstall" in sys.argv:
     CLI_NAME = "hsa"
     for _bd in [Path.home() / ".local" / "bin", Path("/usr/local/bin")]:
         _wp = _bd / CLI_NAME
@@ -92,9 +68,23 @@ elif "--uninstall" in sys.argv:
         shutil.rmtree(HSA_HOME)
         print(f"Removed: {HSA_HOME}")
     sys.exit(0)
+
+# --- Bootstrap: ensure we're in the venv with deps installed ---
+if not _in_hsa_venv():
+    try:
+        import langchain_community  # noqa: F401
+    except ImportError:
+        _bootstrap_venv()  # re-execs into venv, never returns
 else:
-    _INSTALL_REQUESTED = False
-    _ensure_deps()
+    # In venv but deps might be missing (first run after venv creation)
+    try:
+        import langchain_community  # noqa: F401
+    except ImportError:
+        print("Installing dependencies...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
+            stdout=subprocess.DEVNULL,
+        )
 
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -846,7 +836,7 @@ def _install_cli():
 
     # Ensure venv + deps exist
     if not HSA_VENV.exists():
-        _bootstrap_venv()  # This re-execs, so it'll come back here with deps ready
+        _bootstrap_venv()  # re-execs into venv
 
     # Always use ~/.local/bin (no sudo needed)
     bin_dir = Path.home() / ".local" / "bin"
@@ -883,7 +873,7 @@ exec "{venv_python}" "{installed_script}" "$@"
 
 
 def _uninstall_cli():
-    """Remove the CLI wrapper and optionally the venv."""
+    """Remove the CLI wrapper and the venv."""
     removed = False
     for bin_dir in [Path.home() / ".local" / "bin", Path("/usr/local/bin")]:
         link_path = bin_dir / CLI_NAME
@@ -891,24 +881,63 @@ def _uninstall_cli():
             link_path.unlink()
             print(f"Removed: {link_path}")
             removed = True
-
     if HSA_HOME.exists():
         shutil.rmtree(HSA_HOME)
         print(f"Removed: {HSA_HOME}")
         removed = True
-
     if not removed:
         print(f"{CLI_NAME} is not installed.")
 
 
 def main():
+    # ------------------------------------------------------------------
+    # Quick-start: detect if first arg is a path (not a subcommand or flag)
+    # Must happen before argparse since subparsers would eat it.
+    # ------------------------------------------------------------------
+    SUBCOMMANDS = {"ingest", "query", "chat", "agent"}
+    first_arg = sys.argv[1] if len(sys.argv) > 1 else None
+
+    if first_arg and not first_arg.startswith("-") and first_arg not in SUBCOMMANDS and os.path.isdir(first_arg):
+        # Quick-start mode: hsa /path/to/docs [--fresh] [--groq-model X] etc.
+        quick_parser = argparse.ArgumentParser(description="RAG Agent — chat with your docs")
+        quick_parser.add_argument("docs_path", help="Path to directory of .html or .md files.")
+        quick_parser.add_argument("--vectordb", default=None)
+        quick_parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
+        quick_parser.add_argument("--groq-model", default=DEFAULT_GROQ_MODEL)
+        quick_parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+        quick_parser.add_argument("--fresh", action="store_true")
+        args = quick_parser.parse_args()
+
+        docs_path = Path(args.docs_path)
+
+        # Auto-detect: HTML or Markdown?
+        html_files = list(docs_path.rglob("*.html"))
+        md_files = list(docs_path.glob("*.md"))
+
+        if html_files and not md_files:
+            md_dir = str(docs_path.parent / (docs_path.name + "_md"))
+            convert_html_to_md(str(docs_path), md_dir)
+        elif md_files:
+            md_dir = str(docs_path)
+        else:
+            sys.exit(f"No .html or .md files found in: {docs_path}")
+
+        vectordb_dir = args.vectordb or _vectordb_dir_for(md_dir)
+        api_key = _ensure_api_key()
+
+        if args.fresh and Path(vectordb_dir).exists():
+            shutil.rmtree(vectordb_dir)
+
+        _auto_ingest_if_needed(md_dir, vectordb_dir, args.embed_model)
+        agent(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, md_dir)
+        return
+
+    # ------------------------------------------------------------------
+    # Subcommand / flag mode
+    # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(
         description="RAG Agent — chat with your docs",
-        usage="%(prog)s [docs_path] [options]",
-    )
-    parser.add_argument(
-        "docs_path", nargs="?", default=None,
-        help="Path to directory of .html or .md files. HTML is auto-converted to Markdown.",
+        usage="%(prog)s [docs_path] [options]\n       %(prog)s {ingest,query,chat,agent} ...",
     )
     parser.add_argument("--install", action="store_true", help=f"Install as '{CLI_NAME}' CLI command")
     parser.add_argument("--uninstall", action="store_true", help=f"Remove '{CLI_NAME}' CLI command")
@@ -941,7 +970,7 @@ def main():
     # ------------------------------------------------------------------
     # Install / Uninstall
     # ------------------------------------------------------------------
-    if args.install or _INSTALL_REQUESTED:
+    if args.install:
         _install_cli()
         return
     if args.uninstall:
@@ -949,38 +978,7 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # Quick-start mode: here-agent /path/to/docs
-    # ------------------------------------------------------------------
-    if args.docs_path and not args.command:
-        docs_path = Path(args.docs_path)
-        if not docs_path.is_dir():
-            sys.exit(f"Not a directory: {docs_path}")
-
-        # Auto-detect: HTML or Markdown?
-        html_files = list(docs_path.rglob("*.html"))
-        md_files = list(docs_path.glob("*.md"))
-
-        if html_files and not md_files:
-            # HTML docs — convert to MD first
-            md_dir = str(docs_path.parent / (docs_path.name + "_md"))
-            convert_html_to_md(str(docs_path), md_dir)
-        elif md_files:
-            md_dir = str(docs_path)
-        else:
-            sys.exit(f"No .html or .md files found in: {docs_path}")
-
-        vectordb_dir = args.vectordb or _vectordb_dir_for(md_dir)
-        api_key = _ensure_api_key()
-
-        if args.fresh and Path(vectordb_dir).exists():
-            shutil.rmtree(vectordb_dir)
-
-        _auto_ingest_if_needed(md_dir, vectordb_dir, args.embed_model)
-        agent(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, md_dir)
-        return
-
-    # ------------------------------------------------------------------
-    # Subcommand mode (backward-compatible)
+    # Subcommand mode
     # ------------------------------------------------------------------
     if not args.command:
         parser.print_help()
