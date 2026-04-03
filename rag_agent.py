@@ -624,10 +624,15 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_classes",
-            "description": "List all available documented classes/types in the HERE SDK. Use this to discover what's available or find the correct class name.",
+            "description": "List documented classes/types in the HERE SDK. Pass a filter string to narrow results (e.g., 'Maneuver', 'Map', 'Route'). Without a filter, returns a summary of class categories.",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Optional substring filter (case-insensitive). Only classes whose name contains this string are returned. E.g., 'Maneuver', 'Lane', 'SDK'.",
+                    }
+                },
             },
         },
     },
@@ -640,10 +645,15 @@ You have tools to search and read the SDK documentation. Use them to research th
 
 WORKFLOW:
 1. Think about what documentation you need to answer the question.
-2. Use search_docs to find relevant chunks, or list_classes to discover available classes.
-3. Use read_class_doc to get full details on specific classes when needed.
-4. You may call tools multiple times to gather enough context.
-5. Once you have sufficient information, provide your final answer.
+2. Use search_docs to find relevant chunks — this is your primary tool.
+3. Use list_classes with a filter (e.g., filter="Maneuver") to discover class names matching a topic.
+4. Use read_class_doc to get full details on specific classes when needed.
+5. You may call tools multiple times to gather enough context.
+6. Once you have sufficient information, provide your final answer.
+
+TIPS:
+- Prefer search_docs over list_classes for most queries. search_docs does semantic search.
+- When using list_classes, ALWAYS provide a filter string to narrow results (there are 800+ classes).
 
 RULES:
 - Base your answer ONLY on information from the tools. Do NOT use prior knowledge about the HERE SDK.
@@ -653,19 +663,25 @@ RULES:
 
 MAX_AGENT_STEPS = 8
 MAX_CLASS_DOC_LENGTH = 6000  # chars, to avoid blowing up context
+MAX_TOOL_RESULT_CHARS = 8000  # cap any single tool result to avoid context overflow
 
 
 def tool_search_docs(vectorstore, top_k: int, query: str) -> str:
-    """Execute search_docs tool."""
+    """Execute search_docs tool with reranking (mirrors chat mode quality)."""
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": top_k})
     docs = retriever.invoke(query)
     if not docs:
         return "No results found."
+    # Apply keyword reranking (same as chat mode) so best matches come first
+    docs = rerank_docs(docs, query)
     parts = []
     for doc in docs:
         source = Path(doc.metadata.get("source", "unknown")).stem
         parts.append(f"[{source}]\n{doc.page_content}")
-    return "\n---\n".join(parts)
+    result = "\n---\n".join(parts)
+    if len(result) > MAX_TOOL_RESULT_CHARS:
+        result = result[:MAX_TOOL_RESULT_CHARS] + "\n\n... [truncated — use a more specific query or read_class_doc for full details]"
+    return result
 
 
 def tool_read_class_doc(md_dir: str, class_name: str) -> str:
@@ -685,10 +701,22 @@ def tool_read_class_doc(md_dir: str, class_name: str) -> str:
     return content
 
 
-def tool_list_classes(md_dir: str) -> str:
-    """Execute list_classes tool."""
-    classes = sorted(f.stem for f in Path(md_dir).glob("*.md") if f.stem != "index")
-    return f"{len(classes)} classes available:\n" + ", ".join(classes)
+def tool_list_classes(md_dir: str, filter_str: str = "") -> str:
+    """Execute list_classes tool with optional name filter."""
+    all_classes = sorted(f.stem for f in Path(md_dir).glob("*.md") if f.stem != "index")
+    if filter_str:
+        matched = [c for c in all_classes if filter_str.lower() in c.lower()]
+        if not matched:
+            return f"No classes matching '{filter_str}' found. There are {len(all_classes)} classes total. Try a broader filter or use search_docs."
+        return f"{len(matched)} classes matching '{filter_str}' (out of {len(all_classes)} total):\n" + ", ".join(matched)
+    # Without filter, return a compact summary instead of all 869 names
+    total = len(all_classes)
+    sample = all_classes[:30]
+    return (
+        f"{total} classes available. Showing first 30:\n"
+        + ", ".join(sample)
+        + f"\n\n... and {total - 30} more. Use list_classes with a filter (e.g., 'Maneuver', 'Map', 'Route') to find specific classes, or use search_docs for semantic search."
+    )
 
 
 import re as _re
@@ -714,12 +742,15 @@ def _parse_text_tool_calls(text: str):
 def _execute_tool(fn_name: str, fn_args: dict, vectorstore, top_k: int, md_dir: str, question: str) -> str:
     """Execute a tool by name and return the result."""
     if fn_name == "search_docs":
-        return tool_search_docs(vectorstore, top_k, fn_args.get("query", question))
+        result = tool_search_docs(vectorstore, top_k, fn_args.get("query", question))
     elif fn_name == "read_class_doc":
-        return tool_read_class_doc(md_dir, fn_args.get("class_name", ""))
+        result = tool_read_class_doc(md_dir, fn_args.get("class_name", ""))
     elif fn_name == "list_classes":
-        return tool_list_classes(md_dir)
-    return f"Unknown tool: {fn_name}"
+        result = tool_list_classes(md_dir, fn_args.get("filter", ""))
+    else:
+        result = f"Unknown tool: {fn_name}"
+    console.print(f"  [dim]  ↳ result: {len(result)} chars[/dim]")
+    return result
 
 
 def run_agent_turn(question: str, vectorstore, top_k: int, md_dir: str, groq_model: str, api_key: str) -> str:
@@ -825,7 +856,7 @@ def agent(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_
         f"[bold]Tools[/bold] (the agent decides when to use them):\n"
         f"  \U0001f50d [bold]search_docs[/bold]    — semantic search over the documentation\n"
         f"  \U0001f4c4 [bold]read_class_doc[/bold] — read full documentation for a class\n"
-        f"  \U0001f4cb [bold]list_classes[/bold]    — list all documented classes\n\n"
+        f"  \U0001f4cb [bold]list_classes[/bold]    — find classes by name (supports filtering)\n\n"
         f"The agent will research your question using these tools, then answer.\n\n"
         f"Commands: [bold]quit[/bold] / [bold]exit[/bold] / [bold]q[/bold] to leave.",
         border_style="bright_magenta",
