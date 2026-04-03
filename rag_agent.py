@@ -1019,7 +1019,7 @@ def main():
             shutil.rmtree(vectordb_dir)
 
         _auto_ingest_if_needed(md_dir, vectordb_dir, args.embed_model)
-        agent(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, md_dir)
+        chat(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key)
         return
 
     # ------------------------------------------------------------------
