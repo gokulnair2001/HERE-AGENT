@@ -782,6 +782,57 @@ def _auto_ingest_if_needed(md_dir: str, vectordb_dir: str, embed_model: str) -> 
     console.print()
 
 
+CLI_NAME = "hsa"
+
+
+def _install_cli():
+    """Install this script as a CLI command on PATH."""
+    script_path = os.path.abspath(__file__)
+    # Prefer ~/.local/bin (no sudo needed), fall back to /usr/local/bin
+    local_bin = Path.home() / ".local" / "bin"
+    system_bin = Path("/usr/local/bin")
+
+    if local_bin.exists() or not system_bin.exists():
+        bin_dir = local_bin
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        bin_dir = system_bin
+
+    link_path = bin_dir / CLI_NAME
+
+    # Make the script executable
+    os.chmod(script_path, 0o755)
+
+    if link_path.exists() or link_path.is_symlink():
+        link_path.unlink()
+
+    link_path.symlink_to(script_path)
+
+    # Check if bin_dir is on PATH
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    on_path = str(bin_dir) in path_dirs
+
+    print(f"Installed: {link_path} -> {script_path}")
+    if not on_path:
+        shell = os.environ.get("SHELL", "")
+        rc_file = "~/.zshrc" if "zsh" in shell else "~/.bashrc"
+        print(f"\nAdd {bin_dir} to your PATH:")
+        print(f'  echo \'export PATH="{bin_dir}:$PATH"\' >> {rc_file} && source {rc_file}')
+    else:
+        print(f"\nReady! Try: {CLI_NAME} /path/to/docs")
+
+
+def _uninstall_cli():
+    """Remove the CLI symlink."""
+    for bin_dir in [Path.home() / ".local" / "bin", Path("/usr/local/bin")]:
+        link_path = bin_dir / CLI_NAME
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+            print(f"Removed: {link_path}")
+            return
+    print(f"{CLI_NAME} is not installed.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="RAG Agent — chat with your docs",
@@ -791,6 +842,8 @@ def main():
         "docs_path", nargs="?", default=None,
         help="Path to directory of .html or .md files. HTML is auto-converted to Markdown.",
     )
+    parser.add_argument("--install", action="store_true", help=f"Install as '{CLI_NAME}' CLI command")
+    parser.add_argument("--uninstall", action="store_true", help=f"Remove '{CLI_NAME}' CLI command")
     parser.add_argument("--vectordb", default=None, help="Path to ChromaDB directory (auto-derived if omitted)")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Sentence-transformers model name")
     parser.add_argument("--groq-model", default=DEFAULT_GROQ_MODEL, help="Groq LLM model name")
@@ -818,7 +871,17 @@ def main():
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
-    # Quick-start mode: python rag_agent.py /path/to/docs
+    # Install / Uninstall
+    # ------------------------------------------------------------------
+    if args.install:
+        _install_cli()
+        return
+    if args.uninstall:
+        _uninstall_cli()
+        return
+
+    # ------------------------------------------------------------------
+    # Quick-start mode: here-agent /path/to/docs
     # ------------------------------------------------------------------
     if args.docs_path and not args.command:
         docs_path = Path(args.docs_path)
