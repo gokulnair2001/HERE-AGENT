@@ -691,6 +691,37 @@ def tool_list_classes(md_dir: str) -> str:
     return f"{len(classes)} classes available:\n" + ", ".join(classes)
 
 
+import re as _re
+
+
+def _parse_text_tool_calls(text: str):
+    """Parse tool calls when the model outputs them as text instead of structured calls.
+    Handles formats like: <function=search_docs{"query": "..."}></function>
+    """
+    pattern = r'<function=(\w+)(.*?)></function>'
+    matches = _re.findall(pattern, text)
+    calls = []
+    for fn_name, args_str in matches:
+        args_str = args_str.strip()
+        try:
+            fn_args = json.loads(args_str)
+        except json.JSONDecodeError:
+            fn_args = {}
+        calls.append((fn_name, fn_args))
+    return calls
+
+
+def _execute_tool(fn_name: str, fn_args: dict, vectorstore, top_k: int, md_dir: str, question: str) -> str:
+    """Execute a tool by name and return the result."""
+    if fn_name == "search_docs":
+        return tool_search_docs(vectorstore, top_k, fn_args.get("query", question))
+    elif fn_name == "read_class_doc":
+        return tool_read_class_doc(md_dir, fn_args.get("class_name", ""))
+    elif fn_name == "list_classes":
+        return tool_list_classes(md_dir)
+    return f"Unknown tool: {fn_name}"
+
+
 def run_agent_turn(question: str, vectorstore, top_k: int, md_dir: str, groq_model: str, api_key: str) -> str:
     """Run the agent loop: LLM calls tools until it produces a final answer."""
     client = Groq(api_key=api_key)
@@ -700,46 +731,74 @@ def run_agent_turn(question: str, vectorstore, top_k: int, md_dir: str, groq_mod
     ]
 
     for step in range(MAX_AGENT_STEPS):
-        response = client.chat.completions.create(
-            model=groq_model,
-            messages=messages,
-            tools=AGENT_TOOLS,
-            tool_choice="auto",
-            temperature=0.1,
-        )
+        try:
+            response = client.chat.completions.create(
+                model=groq_model,
+                messages=messages,
+                tools=AGENT_TOOLS,
+                tool_choice="auto",
+                temperature=0.1,
+            )
+            msg = response.choices[0].message
 
-        msg = response.choices[0].message
+            # If no tool calls, we have the final answer
+            if not msg.tool_calls:
+                # Check if the text contains tool calls the model wrote as text
+                if msg.content and "<function=" in msg.content:
+                    text_calls = _parse_text_tool_calls(msg.content)
+                    if text_calls:
+                        # Execute parsed text tool calls
+                        results = []
+                        for fn_name, fn_args in text_calls:
+                            console.print(f"  [dim]→ {fn_name}({', '.join(f'{k}={v!r}' for k, v in fn_args.items())})[/dim]")
+                            results.append(_execute_tool(fn_name, fn_args, vectorstore, top_k, md_dir, question))
+                        # Feed results back as assistant + user message
+                        tool_context = "\n---\n".join(results)
+                        messages.append({"role": "assistant", "content": msg.content})
+                        messages.append({"role": "user", "content": f"Here are the tool results:\n{tool_context}\n\nNow provide your final answer based on these results."})
+                        continue
+                return msg.content
 
-        # If no tool calls, we have the final answer
-        if not msg.tool_calls:
-            return msg.content
+            # Process structured tool calls
+            messages.append(msg)
 
-        # Process tool calls
-        messages.append(msg)
+            for tool_call in msg.tool_calls:
+                fn_name = tool_call.function.name
+                try:
+                    fn_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
 
-        for tool_call in msg.tool_calls:
-            fn_name = tool_call.function.name
-            try:
-                fn_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                fn_args = {}
+                console.print(f"  [dim]→ {fn_name}({', '.join(f'{k}={v!r}' for k, v in fn_args.items())})[/dim]")
+                result = _execute_tool(fn_name, fn_args, vectorstore, top_k, md_dir, question)
 
-            console.print(f"  [dim]→ {fn_name}({', '.join(f'{k}={v!r}' for k, v in fn_args.items())})[/dim]")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
 
-            if fn_name == "search_docs":
-                result = tool_search_docs(vectorstore, top_k, fn_args.get("query", question))
-            elif fn_name == "read_class_doc":
-                result = tool_read_class_doc(md_dir, fn_args.get("class_name", ""))
-            elif fn_name == "list_classes":
-                result = tool_list_classes(md_dir)
-            else:
-                result = f"Unknown tool: {fn_name}"
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
+        except Exception as e:
+            error_msg = str(e)
+            # Handle the text-based tool call error from Groq
+            if "tool_use_failed" in error_msg and "failed_generation" in error_msg:
+                # Extract the failed generation and parse it
+                try:
+                    err_data = json.loads(error_msg.split(" - ", 1)[1])
+                    failed_text = err_data.get("error", {}).get("failed_generation", "")
+                    text_calls = _parse_text_tool_calls(failed_text)
+                    if text_calls:
+                        results = []
+                        for fn_name, fn_args in text_calls:
+                            console.print(f"  [dim]→ {fn_name}({', '.join(f'{k}={v!r}' for k, v in fn_args.items())})[/dim]")
+                            results.append(_execute_tool(fn_name, fn_args, vectorstore, top_k, md_dir, question))
+                        tool_context = "\n---\n".join(results)
+                        messages.append({"role": "assistant", "content": f"I searched the documentation."})
+                        messages.append({"role": "user", "content": f"Here are the tool results:\n{tool_context}\n\nNow provide your final answer based on these results."})
+                        continue
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    pass
+            raise
 
     # If we exhaust steps, ask for a final answer
     messages.append({"role": "user", "content": "Please provide your final answer now based on what you've found."})
