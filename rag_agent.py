@@ -24,22 +24,77 @@ REQUIRED_PACKAGES = [
     "beautifulsoup4", "markdownify",
 ]
 
+HSA_HOME = Path.home() / ".hsa"
+HSA_VENV = HSA_HOME / "venv"
+
+
+def _in_hsa_venv() -> bool:
+    """Check if we're running inside the hsa managed venv."""
+    return str(HSA_VENV) in sys.executable
+
+
+def _bootstrap_venv():
+    """Create the hsa venv, install deps, and re-exec this script inside it."""
+    HSA_HOME.mkdir(parents=True, exist_ok=True)
+
+    if not HSA_VENV.exists():
+        print("Creating virtual environment (one-time)...")
+        subprocess.check_call([sys.executable, "-m", "venv", str(HSA_VENV)])
+
+    venv_python = str(HSA_VENV / "bin" / "python")
+
+    print("Installing dependencies (one-time)...")
+    subprocess.check_call(
+        [venv_python, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
+        stdout=subprocess.DEVNULL,
+    )
+
+    # Re-exec this script using the venv python
+    os.execv(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:])
+
 
 def _ensure_deps():
-    """Auto-install missing dependencies."""
+    """Auto-install missing dependencies, creating a venv if needed."""
     try:
         from langchain_community.document_loaders import DirectoryLoader, TextLoader
         from langchain_community.vectorstores import Chroma
         from groq import Groq
         from rich.console import Console
     except ImportError:
-        print("Installing dependencies (one-time)...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
-            stdout=subprocess.DEVNULL,
-        )
+        if _in_hsa_venv():
+            # Already in venv but deps missing — just pip install
+            print("Installing dependencies...")
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q"] + REQUIRED_PACKAGES,
+                stdout=subprocess.DEVNULL,
+            )
+        else:
+            # Not in venv — bootstrap one and re-exec
+            _bootstrap_venv()
+            # _bootstrap_venv calls os.execv, so we never reach here
 
-_ensure_deps()
+
+# Handle --install before loading heavy deps (works from system python)
+if "--install" in sys.argv:
+    if not _in_hsa_venv():
+        _bootstrap_venv()  # re-execs into venv, never returns
+    # Now in venv — ensure deps are installed, then let main() handle --install
+    _ensure_deps()
+    _INSTALL_REQUESTED = True
+elif "--uninstall" in sys.argv:
+    CLI_NAME = "hsa"
+    for _bd in [Path.home() / ".local" / "bin", Path("/usr/local/bin")]:
+        _wp = _bd / CLI_NAME
+        if _wp.exists():
+            _wp.unlink()
+            print(f"Removed: {_wp}")
+    if HSA_HOME.exists():
+        shutil.rmtree(HSA_HOME)
+        print(f"Removed: {HSA_HOME}")
+    sys.exit(0)
+else:
+    _INSTALL_REQUESTED = False
+    _ensure_deps()
 
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -788,31 +843,36 @@ CLI_NAME = "hsa"
 def _install_cli():
     """Install this script as a CLI command on PATH."""
     script_path = os.path.abspath(__file__)
-    # Prefer ~/.local/bin (no sudo needed), fall back to /usr/local/bin
-    local_bin = Path.home() / ".local" / "bin"
-    system_bin = Path("/usr/local/bin")
 
-    if local_bin.exists() or not system_bin.exists():
-        bin_dir = local_bin
-        bin_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        bin_dir = system_bin
+    # Ensure venv + deps exist
+    if not HSA_VENV.exists():
+        _bootstrap_venv()  # This re-execs, so it'll come back here with deps ready
 
-    link_path = bin_dir / CLI_NAME
+    # Always use ~/.local/bin (no sudo needed)
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
 
-    # Make the script executable
-    os.chmod(script_path, 0o755)
+    wrapper_path = bin_dir / CLI_NAME
+    venv_python = HSA_VENV / "bin" / "python"
 
-    if link_path.exists() or link_path.is_symlink():
-        link_path.unlink()
+    # Copy the script to ~/.hsa/ so it's self-contained
+    installed_script = HSA_HOME / "rag_agent.py"
+    shutil.copy2(script_path, installed_script)
 
-    link_path.symlink_to(script_path)
+    # Write a wrapper shell script that uses the venv python
+    wrapper_content = f"""#!/bin/sh
+exec "{venv_python}" "{installed_script}" "$@"
+"""
+    wrapper_path.write_text(wrapper_content)
+    wrapper_path.chmod(0o755)
 
     # Check if bin_dir is on PATH
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
     on_path = str(bin_dir) in path_dirs
 
-    print(f"Installed: {link_path} -> {script_path}")
+    print(f"Installed: {wrapper_path}")
+    print(f"  venv:   {HSA_VENV}")
+    print(f"  script: {installed_script}")
     if not on_path:
         shell = os.environ.get("SHELL", "")
         rc_file = "~/.zshrc" if "zsh" in shell else "~/.bashrc"
@@ -823,14 +883,22 @@ def _install_cli():
 
 
 def _uninstall_cli():
-    """Remove the CLI symlink."""
+    """Remove the CLI wrapper and optionally the venv."""
+    removed = False
     for bin_dir in [Path.home() / ".local" / "bin", Path("/usr/local/bin")]:
         link_path = bin_dir / CLI_NAME
-        if link_path.is_symlink() or link_path.exists():
+        if link_path.exists():
             link_path.unlink()
             print(f"Removed: {link_path}")
-            return
-    print(f"{CLI_NAME} is not installed.")
+            removed = True
+
+    if HSA_HOME.exists():
+        shutil.rmtree(HSA_HOME)
+        print(f"Removed: {HSA_HOME}")
+        removed = True
+
+    if not removed:
+        print(f"{CLI_NAME} is not installed.")
 
 
 def main():
@@ -873,7 +941,7 @@ def main():
     # ------------------------------------------------------------------
     # Install / Uninstall
     # ------------------------------------------------------------------
-    if args.install:
+    if args.install or _INSTALL_REQUESTED:
         _install_cli()
         return
     if args.uninstall:
