@@ -1036,7 +1036,8 @@ def main():
         html_files = list(docs_path.rglob("*.html"))
         md_files = list(docs_path.glob("*.md"))
 
-        if html_files and not md_files:
+        if html_files:
+            # HTML dir may contain stray .md files — always convert HTML
             md_dir = str(docs_path.parent / (docs_path.name + "_md"))
             convert_html_to_md(str(docs_path), md_dir)
         elif md_files:
