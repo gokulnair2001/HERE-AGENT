@@ -1,6 +1,6 @@
 # HSA — HERE SDK Agent
 
-A single-file CLI agent that lets you chat with any documentation (HTML or Markdown) using Groq + ChromaDB. One command does everything: creates a venv, installs deps, converts HTML, indexes docs, and starts an interactive agent.
+A single-file CLI agent that lets you chat with HERE SDK documentation (HTML or Markdown) for **any platform** — iOS, Android, Flutter, or generic. One command does everything: creates a venv, installs deps, converts HTML, indexes docs, and starts an interactive agent.
 
 ## Install
 
@@ -24,11 +24,40 @@ hsa /path/to/your/docs
 
 Point it at a folder of `.html` or `.md` files. On first run it:
 1. Converts HTML to Markdown (if the folder contains `.html` files)
-2. Prompts for your Groq API key (free at https://console.groq.com/keys)
-3. Indexes your docs into a local vector DB
-4. Starts an interactive agent with search, read, and list tools
+2. **Auto-detects the platform** (iOS/Android/Flutter) from the docs directory name or file contents
+3. Prompts for your Groq API key (free at https://console.groq.com/keys)
+4. Indexes your docs into a local vector DB
+5. Starts an interactive chat with query expansion, reranking, and skill detection
 
-Subsequent runs skip steps 1–3 and go straight to chat.
+Subsequent runs skip steps 1–4 and go straight to chat.
+
+## Multi-Platform Support
+
+The agent auto-detects the platform from your docs folder name (e.g. `heresdk-ios-*` → iOS, `heresdk-android-*` → Android). You can also specify it explicitly:
+
+```bash
+# Auto-detect (default)
+hsa /path/to/heresdk-ios-docs
+
+# Explicit platform
+hsa /path/to/docs --platform ios
+hsa /path/to/docs --platform android
+hsa /path/to/docs --platform flutter
+hsa /path/to/docs --platform generic
+```
+
+| Platform  | Language | Code Blocks |
+|-----------|----------|-------------|
+| `ios`     | Swift    | `` ```swift ``  |
+| `android` | Kotlin   | `` ```kotlin `` |
+| `flutter` | Dart     | `` ```dart ``   |
+| `generic` | Auto     | Plain       |
+
+The platform setting controls:
+- System prompts (e.g. "HERE SDK for Android")
+- Code generation language (Swift / Kotlin / Dart)
+- Skill keyword detection (platform-specific terms like "uikit", "gradle", "widget")
+- Query expansion prompts
 
 ## Usage
 
@@ -56,21 +85,18 @@ hsa ingest docs/md --fresh
 # Single question
 hsa query "How do I use MapView?"
 
-# Simple chat (single-shot retrieval, no tool calling)
-hsa chat
-
-# Agent mode (tool calling, multi-step reasoning)
-hsa agent --md-dir docs/md
+# Interactive chat
+hsa chat --platform android
 ```
 
 ## How It Works
 
-The agent has 3 tools it can use autonomously:
-- **search_docs** — semantic search over the vector DB
-- **read_class_doc** — reads a full `.md` file for a specific class
-- **list_classes** — lists all documented classes
-
-It decides which tools to call (up to 8 steps), gathers context, then answers grounded in the docs.
+The chat uses a multi-stage retrieval pipeline:
+1. **Query expansion** — LLM generates 2-3 refined search queries from your question
+2. **Semantic search** — retrieves relevant doc chunks from the vector DB
+3. **Keyword reranking** — boosts chunks that share terms with your question
+4. **Skill detection** — auto-detects the best response format (code, comparison, troubleshooting, tutorial)
+5. **Grounded answer** — LLM answers strictly from retrieved context with source citations
 
 ## Uninstall
 
