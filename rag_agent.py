@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -22,12 +23,37 @@ warnings.filterwarnings("ignore", message=".*Pydantic V1.*")
 
 REQUIRED_PACKAGES = [
     "langchain-community", "langchain-text-splitters", "chromadb",
-    "sentence-transformers", "groq", "rich", "python-dotenv",
+    "sentence-transformers", "groq", "anthropic", "rich", "python-dotenv",
     "beautifulsoup4", "markdownify",
 ]
 
 HSA_HOME = Path.home() / ".hsa"
 HSA_VENV = HSA_HOME / "venv"
+HSA_CONFIG_FILE = HSA_HOME / "config.json"
+
+
+def _load_config() -> dict:
+    """Load persisted config from ~/.hsa/config.json."""
+    if HSA_CONFIG_FILE.exists():
+        try:
+            return json.loads(HSA_CONFIG_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_config(data: dict) -> None:
+    """Merge data into ~/.hsa/config.json."""
+    HSA_HOME.mkdir(parents=True, exist_ok=True)
+    existing = _load_config()
+    existing.update(data)
+    HSA_CONFIG_FILE.write_text(json.dumps(existing, indent=2))
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception looks like an invalid/expired API key."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("401", "403", "authentication", "invalid api key", "api_key", "unauthorized", "invalid x-api-key"))
 
 
 def _in_hsa_venv() -> bool:
@@ -208,12 +234,20 @@ console = Console(theme=custom_theme)
 DEFAULT_VECTORDB_DIR = "./vectordb"
 DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_TOP_K = 8
 
-AVAILABLE_MODELS = [
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-]
+AVAILABLE_MODELS = {
+    "groq": [
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+    ],
+    "claude": [
+        "claude-sonnet-4-6",
+        "claude-opus-4-5",
+        "claude-haiku-4-5-20251001",
+    ],
+}
 
 # ---------------------------------------------------------------------------
 # Platform configuration — auto-detected or user-specified
@@ -284,46 +318,74 @@ def get_platform_config(platform: str) -> dict:
     return PLATFORM_CONFIGS.get(platform, PLATFORM_CONFIGS["generic"])
 
 
-def _pick_model(default: str = DEFAULT_GROQ_MODEL) -> str:
-    """Interactive model picker shown at startup."""
-    console.print("[bold]Select a model:[/bold]")
-    for i, model in enumerate(AVAILABLE_MODELS, 1):
+def _pick_provider() -> str:
+    """Ask Groq or Claude — skip if already saved in config."""
+    cfg = _load_config()
+    saved = cfg.get("provider")
+    if saved in ("groq", "claude"):
+        console.print(f"[info]Provider: [bold]{saved}[/bold]  [dim](saved — delete ~/.hsa/config.json to reset)[/dim][/info]")
+        return saved
+    console.print("[bold]Select LLM provider:[/bold]")
+    console.print("  [cyan]1[/cyan]. Groq    [dim](free & fast — console.groq.com)[/dim]")
+    console.print("  [cyan]2[/cyan]. Claude  [dim](Anthropic — console.anthropic.com)[/dim]")
+    choice = Prompt.ask("Enter 1 or 2", default="1").strip()
+    provider = "claude" if choice == "2" else "groq"
+    _save_config({"provider": provider})
+    return provider
+
+
+def _pick_model(provider: str) -> str:
+    """Interactive model picker — shows models for the active provider."""
+    models = AVAILABLE_MODELS[provider]
+    default = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_MODEL
+    console.print(f"[bold]Select a {provider.capitalize()} model:[/bold]")
+    for i, model in enumerate(models, 1):
         marker = " [dim](default)[/dim]" if model == default else ""
         console.print(f"  [cyan]{i}[/cyan]. {model}{marker}")
-    choice = Prompt.ask(
-        "Enter number or model name",
-        default=str(AVAILABLE_MODELS.index(default) + 1) if default in AVAILABLE_MODELS else "1",
-    ).strip()
-    # Accept a number
-    if choice.isdigit() and 1 <= int(choice) <= len(AVAILABLE_MODELS):
-        selected = AVAILABLE_MODELS[int(choice) - 1]
-    # Accept a name (exact or substring)
-    elif choice in AVAILABLE_MODELS:
+    idx_default = str(models.index(default) + 1) if default in models else "1"
+    choice = Prompt.ask("Enter number or model name", default=idx_default).strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(models):
+        selected = models[int(choice) - 1]
+    elif choice in models:
         selected = choice
     else:
-        matches = [m for m in AVAILABLE_MODELS if choice.lower() in m.lower()]
+        matches = [m for m in models if choice.lower() in m.lower()]
         selected = matches[0] if matches else default
     console.print(f"Using model: [cyan]{selected}[/cyan]\n")
     return selected
 
 SYSTEM_PROMPT = """\
-You are a technical assistant for the {sdk_name}.
+You are a precise technical assistant for the {sdk_name}.
 
-STRICT RULES:
-1. Answer ONLY based on the provided context. Do NOT use prior knowledge about the HERE SDK.
-2. If the context does not contain the answer, respond with: "I don't have enough information in the documentation to answer this. The relevant docs may not be indexed, or try rephrasing your question."
-3. Always cite the exact class, method, or property names as they appear in the context.
-4. Do NOT invent method signatures, parameters, or return types. If a signature is partially visible, say so.
-5. When referencing a class, include [SourceFile] attribution.
+━━━ STRICT GROUNDING RULES ━━━
+1. CONTEXT IS YOUR ONLY SOURCE. Do NOT use any prior knowledge about the HERE SDK, its APIs,
+   or any external documentation. Every fact in your answer must trace back to a chunk below.
+2. BEFORE writing your answer, silently scan the context and identify which chunk(s) directly
+   support each part of your response. If no chunk supports a claim, omit that claim entirely.
+3. PARTIAL CONTEXT: If the context partially answers the question, answer what is confirmed,
+   then explicitly state: "⚠ The context does not cover [specific missing part] — try rephrasing
+   or check if those docs are indexed."
+4. NO ANSWER: If the context contains nothing relevant, respond exactly with:
+   "I don't have enough information in the indexed documentation to answer this.
+    The relevant docs may not be indexed — try rephrasing, or run with --fresh to re-ingest."
+5. EXACT NAMES ONLY: Copy class names, method names, parameter names, and return types
+   character-for-character from the context. Never guess or normalize capitalization.
+6. NEVER invent method signatures, parameter types, return types, or enum values.
+   If a signature is only partially visible in the context, say so explicitly.
+7. SOURCE ATTRIBUTION: Every class or method you mention must be followed by its source
+   in parentheses, e.g. MapView (MapView.md).
 
+━━━ RESPONSE FORMAT ━━━
 {skill_instructions}
 
-Context (each block is prefixed with [SourceFile]):
+━━━ CONTEXT ━━━
 {context}
 
-Question: {question}
+━━━ QUESTION ━━━
+{question}
 
-Answer (cite sources, refuse if context is insufficient):"""
+━━━ ANSWER ━━━
+(Ground every statement in the context above. Cite sources inline.)"""
 
 # ---------------------------------------------------------------------------
 # Skills — auto-detected from the user's question
@@ -334,50 +396,62 @@ SKILLS = {
         "keywords": ["code", "example", "snippet", "implement", "how to", "show me", "write", "sample", "usage"],
         "instructions": (
             "SKILL: Code Generation\n"
-            "- Provide a working {language} code example that directly answers the question.\n"
-            "- Include necessary imports.\n"
-            "- Add brief inline comments explaining key lines.\n"
-            "- If the context shows method signatures, use them exactly.\n"
-            "- Wrap code in ```{code_fence} fenced blocks."
+            "- Write a self-contained {language} example that directly answers the question.\n"
+            "- Use ONLY class names, method names, and signatures that appear verbatim in the context.\n"
+            "- If the context shows a method signature, reproduce it exactly — do not add or remove parameters.\n"
+            "- Include all necessary imports shown in the context.\n"
+            "- Add concise inline comments on non-obvious lines.\n"
+            "- Wrap code in ```{code_fence} fenced blocks.\n"
+            "- If a required step (e.g. initialisation, permission) is mentioned in the context but the\n"
+            "  full code is not shown, add a TODO comment instead of inventing code.\n"
+            "- Do NOT produce a code example if the context lacks enough detail — explain what is missing instead."
         ),
     },
     "compare": {
         "keywords": ["compare", "difference", "vs", "versus", "differ", "which one", "better", "alternative", "instead of"],
         "instructions": (
             "SKILL: API Comparison\n"
-            "- Present a clear side-by-side comparison using a Markdown table.\n"
-            "- Columns: Feature | Class/Method A | Class/Method B\n"
-            "- Highlight key differences in purpose, parameters, and return types.\n"
-            "- End with a short recommendation on when to use each."
+            "- Present a Markdown table: Feature | {first} | {second} (derive names from the question).\n"
+            "- Populate cells ONLY with information found in the context; write '—' where context is silent.\n"
+            "- Highlight differences in purpose, key methods, parameters, and return types.\n"
+            "- If the context only covers one of the two items, say so clearly before the table.\n"
+            "- End with a short 'When to use each' section grounded in the context."
         ),
     },
     "troubleshoot": {
         "keywords": ["error", "crash", "fail", "issue", "bug", "problem", "not working", "exception", "nil", "null", "debug", "fix", "wrong"],
         "instructions": (
             "SKILL: Troubleshooting\n"
-            "- Start with the most likely cause of the issue.\n"
-            "- List possible causes as numbered steps, ordered by likelihood.\n"
-            "- For each cause, provide a concrete fix with code if applicable.\n"
-            "- Mention any known gotchas or prerequisites (e.g., permissions, initialization order).\n"
-            "- If the context is insufficient, list what information would be needed to diagnose further."
+            "- List probable causes as numbered items, ordered by likelihood based on the context.\n"
+            "- For each cause: (a) describe the root cause, (b) provide a fix with {language} code if the\n"
+            "  context supports it, (c) cite the source chunk.\n"
+            "- Highlight any prerequisites, initialization order requirements, or permissions mentioned\n"
+            "  in the context that are commonly missed.\n"
+            "- If the context mentions specific error codes or exception types, quote them exactly.\n"
+            "- If the context is insufficient to diagnose the issue, state what additional information\n"
+            "  (logs, SDK version, platform) would be needed."
         ),
     },
     "tutorial": {
         "keywords": ["tutorial", "guide", "walkthrough", "step by step", "steps", "setup", "get started", "integrate", "configure", "build"],
         "instructions": (
             "SKILL: Tutorial / Step-by-Step Guide\n"
-            "- Break the answer into numbered steps.\n"
-            "- Each step should have a short heading and explanation.\n"
-            "- Include {language} code snippets where relevant.\n"
-            "- Note any prerequisites at the top (imports, permissions, setup).\n"
-            "- End with a 'What's Next' suggestion if applicable."
+            "- Start with a '## Prerequisites' section listing imports, permissions, and setup steps\n"
+            "  found in the context.\n"
+            "- Number each step. Give each step a short `### Step N: Title` heading.\n"
+            "- Include {language} code snippets for each step where the context provides enough detail.\n"
+            "- If a step is referenced in the context but lacks detail, add a placeholder note rather\n"
+            "  than inventing content.\n"
+            "- End with a '## What's Next' section if the context mentions follow-up topics."
         ),
     },
 }
 
 DEFAULT_SKILL_INSTRUCTIONS = (
-    "Provide a clear, well-structured answer. "
-    "Use Markdown formatting: headings, bullet points, code blocks where appropriate."
+    "Structure your answer with:\n"
+    "1. A one-sentence direct answer to the question.\n"
+    "2. Supporting detail using Markdown headings, bullet points, and inline code where relevant.\n"
+    "3. A 'Sources' line at the end listing every .md file you drew from."
 )
 
 
@@ -401,28 +475,28 @@ def detect_skill(question: str, platform_cfg: dict = None) -> str:
 QUERY_EXPANSION_PROMPT = """\
 You are a search query optimizer for {sdk_name} API documentation.
 
-Given a user question, generate 2-3 short search queries that would find the relevant API classes, methods, or properties. Think about:
-- What class names are likely relevant (e.g., "show a map" → MapView, MapScene)
-- What method or property names might exist
-- Related classes the user might need
+Your job is to generate 3 DIVERSE search queries from the user's question so that a vector
+search retrieves the most relevant API chunks. Make the queries meaningfully different from
+each other — vary the angle, not just the wording.
+
+Query strategies to consider (pick the most useful 3):
+  1. CLASS-LEVEL  — name the likely SDK class(es) involved (e.g. "MapView initialisation")
+  2. METHOD-LEVEL — name the likely method or property (e.g. "loadScene mapScheme")
+  3. CONCEPT-LEVEL — use the underlying concept in plain English (e.g. "change map style at runtime")
+  4. ERROR/SYMPTOM — if the question mentions a problem, phrase it as an error symptom
+  5. RELATED CLASS — a helper/delegate/listener class that often pairs with the main class
 
 User question: {question}
 
-Return ONLY the search queries, one per line. No explanations."""
+Return EXACTLY 3 search queries, one per line. No numbering, no explanations, no blank lines."""
 
 
-def expand_query(question: str, api_key: str, groq_model: str, platform_cfg: dict = None) -> list[str]:
+def expand_query(question: str, api_key: str, provider: str, model: str, platform_cfg: dict = None) -> list[str]:
     """Use the LLM to generate better search queries from a natural language question."""
     cfg = platform_cfg or get_platform_config("generic")
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model=groq_model,
-        messages=[{"role": "user", "content": QUERY_EXPANSION_PROMPT.format(sdk_name=cfg["sdk_name"], question=question)}],
-        temperature=0.0,
-        max_tokens=150,
-    )
-    lines = [l.strip() for l in response.choices[0].message.content.strip().split("\n") if l.strip()]
-    return lines
+    messages = [{"role": "user", "content": QUERY_EXPANSION_PROMPT.format(sdk_name=cfg["sdk_name"], question=question)}]
+    content = call_llm(messages, provider, model, api_key, temperature=0.0, max_tokens=200)
+    return [l.strip() for l in content.strip().split("\n") if l.strip()]
 
 
 def get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddings:
@@ -520,11 +594,11 @@ def get_retriever(vectordb_dir: str, embed_model: str, top_k: int):
     return vectorstore, top_k
 
 
-def retrieve_with_expansion(vectorstore, top_k: int, question: str, api_key: str, groq_model: str, platform_cfg: dict = None):
+def retrieve_with_expansion(vectorstore, top_k: int, question: str, api_key: str, provider: str, model: str, platform_cfg: dict = None):
     """Retrieve docs using the original query + LLM-expanded queries, then deduplicate."""
     all_queries = [question]
     try:
-        expanded = expand_query(question, api_key, groq_model, platform_cfg)
+        expanded = expand_query(question, api_key, provider, model, platform_cfg)
         all_queries.extend(expanded)
     except Exception:
         pass  # Fall back to original query only
@@ -559,8 +633,8 @@ def rerank_docs(docs, question: str):
     return sorted(docs, key=score, reverse=True)
 
 
-def ask_groq(question: str, context_docs, groq_model: str, api_key: str, platform_cfg: dict = None):
-    """Send question + retrieved context to Groq and return the answer."""
+def ask_llm(question: str, context_docs, provider: str, model: str, api_key: str, platform_cfg: dict = None):
+    """Send question + retrieved context to the active LLM and return the answer."""
     cfg = platform_cfg or get_platform_config("generic")
     context_parts = []
     for doc in context_docs:
@@ -582,13 +656,8 @@ def ask_groq(question: str, context_docs, groq_model: str, api_key: str, platfor
         skill_instructions=skill_instructions,
     )
 
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model=groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-    )
-    return response.choices[0].message.content, skill_name
+    content = call_llm([{"role": "user", "content": prompt}], provider, model, api_key, temperature=0.1)
+    return content, skill_name
 
 
 SKILL_LABELS = {
@@ -626,19 +695,26 @@ def print_answer(answer: str, docs, skill_name: str = None) -> None:
     console.print()
 
 
-def query(question: str, vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_key: str, platform_cfg: dict = None) -> None:
+def query(question: str, vectordb_dir: str, embed_model: str, provider: str, model: str, top_k: int, api_key: str, platform_cfg: dict = None) -> None:
     """Ask a single question."""
     if not Path(vectordb_dir).is_dir():
         sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
 
     vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
-    docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, groq_model, platform_cfg)
+    docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, provider, model, platform_cfg)
     docs = rerank_docs(docs, question)
-    answer, skill_name = ask_groq(question, docs, groq_model, api_key, platform_cfg)
+    try:
+        answer, skill_name = ask_llm(question, docs, provider, model, api_key, platform_cfg)
+    except Exception as e:
+        if _is_auth_error(e):
+            api_key = _refresh_api_key(provider)
+            answer, skill_name = ask_llm(question, docs, provider, model, api_key, platform_cfg)
+        else:
+            raise
     print_answer(answer, docs, skill_name)
 
 
-def chat(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_key: str, platform_cfg: dict = None) -> None:
+def chat(vectordb_dir: str, embed_model: str, provider: str, top_k: int, api_key: str, platform_cfg: dict = None) -> None:
     """Interactive chat loop."""
     cfg = platform_cfg or get_platform_config("generic")
     if not Path(vectordb_dir).is_dir():
@@ -648,11 +724,11 @@ def chat(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_k
     vectorstore, top_k = get_retriever(vectordb_dir, embed_model, top_k)
     console.print()
 
-    groq_model = _pick_model(groq_model)
+    model = _pick_model(provider)
 
     console.print(Panel(
         f"[bold]{cfg['sdk_name']} Documentation Agent[/bold]\n\n"
-        f"Platform: [cyan]{cfg['language']}[/cyan] | Model: [cyan]{groq_model}[/cyan] via Groq\n\n"
+        f"Platform: [cyan]{cfg['language']}[/cyan] | Model: [cyan]{model}[/cyan] via [cyan]{provider.capitalize()}[/cyan]\n\n"
         f"[bold]Skills[/bold] (auto-detected from your question):\n"
         f"  \U0001f4bb [bold]Code Generation[/bold]  — \"Show me how to...\", \"example of...\"\n"
         f"  \u2696\ufe0f  [bold]API Comparison[/bold]   — \"Compare X vs Y\", \"difference between...\"\n"
@@ -678,10 +754,21 @@ def chat(vectordb_dir: str, embed_model: str, groq_model: str, top_k: int, api_k
             console.print("[warning]Bye![/warning]")
             break
 
+        answer = skill_name = None
         with console.status("[info]Thinking...[/info]", spinner="dots"):
-            docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, groq_model, cfg)
+            docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, provider, model, cfg)
             docs = rerank_docs(docs, question)
-            answer, skill_name = ask_groq(question, docs, groq_model, api_key, cfg)
+            try:
+                answer, skill_name = ask_llm(question, docs, provider, model, api_key, cfg)
+            except Exception as e:
+                if not _is_auth_error(e):
+                    raise
+                # answer stays None → handled below, outside the spinner
+
+        if answer is None:
+            # Key was rejected — prompt outside spinner so the terminal works cleanly
+            api_key = _refresh_api_key(provider)
+            answer, skill_name = ask_llm(question, docs, provider, model, api_key, cfg)
 
         print_answer(answer, docs, skill_name)
 
@@ -693,17 +780,71 @@ def _vectordb_dir_for(md_dir: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(md_dir)), ".vectordb_" + Path(md_dir).name)
 
 
-def _ensure_api_key() -> str:
-    """Get the Groq API key from env or prompt the user."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        console.print("[warning]GROQ_API_KEY not found in environment.[/warning]")
-        console.print("Get a free key at: [bold]https://console.groq.com/keys[/bold]\n")
-        api_key = Prompt.ask("Paste your Groq API key").strip()
-        if not api_key:
-            sys.exit("No API key provided.")
-        os.environ["GROQ_API_KEY"] = api_key
-    return api_key
+_PROVIDER_META = {
+    "groq":   {"env": "GROQ_API_KEY",      "cfg_key": "groq_api_key",      "url": "https://console.groq.com/keys"},
+    "claude": {"env": "ANTHROPIC_API_KEY",  "cfg_key": "anthropic_api_key", "url": "https://console.anthropic.com/keys"},
+}
+
+
+def _ensure_api_key(provider: str) -> str:
+    """Return the API key for the given provider.
+
+    Priority: env var → saved config → prompt user (then save).
+    """
+    meta = _PROVIDER_META[provider]
+    # 1. Environment variable
+    key = os.environ.get(meta["env"])
+    if key:
+        return key
+    # 2. Saved config
+    key = _load_config().get(meta["cfg_key"])
+    if key:
+        os.environ[meta["env"]] = key   # make available to child libs
+        return key
+    # 3. Prompt once and persist
+    console.print(f"[warning]No API key found for {provider.capitalize()}.[/warning]")
+    console.print(f"Get one at: [bold]{meta['url']}[/bold]\n")
+    key = Prompt.ask(f"Paste your {provider.capitalize()} API key").strip()
+    if not key:
+        sys.exit("No API key provided.")
+    _save_config({meta["cfg_key"]: key})
+    os.environ[meta["env"]] = key
+    return key
+
+
+def _refresh_api_key(provider: str) -> str:
+    """Called when a key is rejected — prompt for a replacement and save it."""
+    meta = _PROVIDER_META[provider]
+    console.print(f"\n[warning]⚠  Your {provider.capitalize()} API key is invalid or has expired.[/warning]")
+    console.print(f"Get a new one at: [bold]{meta['url']}[/bold]\n")
+    key = Prompt.ask(f"Paste a new {provider.capitalize()} API key (or press Enter to quit)").strip()
+    if not key:
+        sys.exit("Aborted.")
+    _save_config({meta["cfg_key"]: key})
+    os.environ[meta["env"]] = key
+    return key
+
+
+def call_llm(messages: list, provider: str, model: str, api_key: str, **kwargs) -> str:
+    """Unified LLM call — routes to Groq or Anthropic based on provider."""
+    if provider == "groq":
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
+        return resp.choices[0].message.content
+    elif provider == "claude":
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
+        user_msgs = [m for m in messages if m["role"] != "system"]
+        resp = client.messages.create(
+            model=model,
+            max_tokens=kwargs.get("max_tokens", 2048),
+            system=system_msg,
+            messages=user_msgs,
+        )
+        return resp.content[0].text
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
 
 def _auto_ingest_if_needed(md_dir: str, vectordb_dir: str, embed_model: str) -> None:
@@ -786,12 +927,13 @@ def main():
     first_arg = sys.argv[1] if len(sys.argv) > 1 else None
 
     if first_arg and not first_arg.startswith("-") and first_arg not in SUBCOMMANDS and os.path.isdir(first_arg):
-        # Quick-start mode: hsa /path/to/docs [--fresh] [--groq-model X] etc.
+        # Quick-start mode: hsa /path/to/docs [--fresh] [--provider groq|claude] etc.
         quick_parser = argparse.ArgumentParser(description="RAG Agent — chat with your docs")
         quick_parser.add_argument("docs_path", help="Path to directory of .html or .md files.")
         quick_parser.add_argument("--vectordb", default=None)
         quick_parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
-        quick_parser.add_argument("--groq-model", default=DEFAULT_GROQ_MODEL)
+        quick_parser.add_argument("--provider", default=None, choices=["groq", "claude"],
+                                  help="LLM provider (saved after first choice if omitted)")
         quick_parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
         quick_parser.add_argument("--fresh", action="store_true")
         quick_parser.add_argument("--platform", default=None, choices=list(PLATFORM_CONFIGS.keys()),
@@ -814,7 +956,13 @@ def main():
             sys.exit(f"No .html or .md files found in: {docs_path}")
 
         vectordb_dir = args.vectordb or _vectordb_dir_for(md_dir)
-        api_key = _ensure_api_key()
+
+        # Provider → key (provider flag overrides saved config for this run)
+        if args.provider:
+            provider = args.provider
+        else:
+            provider = _pick_provider()
+        api_key = _ensure_api_key(provider)
 
         if args.fresh and Path(vectordb_dir).exists():
             shutil.rmtree(vectordb_dir)
@@ -825,7 +973,7 @@ def main():
         platform_cfg = get_platform_config(platform)
         console.print(f"[info]Detected platform: {platform} ({platform_cfg['sdk_name']})[/info]")
 
-        chat(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, platform_cfg)
+        chat(vectordb_dir, args.embed_model, provider, args.top_k, api_key, platform_cfg)
         return
 
     # ------------------------------------------------------------------
@@ -839,7 +987,8 @@ def main():
     parser.add_argument("--uninstall", action="store_true", help=f"Remove '{CLI_NAME}' CLI command")
     parser.add_argument("--vectordb", default=None, help="Path to ChromaDB directory (auto-derived if omitted)")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Sentence-transformers model name")
-    parser.add_argument("--groq-model", default=DEFAULT_GROQ_MODEL, help="Groq LLM model name")
+    parser.add_argument("--provider", default=None, choices=["groq", "claude"],
+                        help="LLM provider: groq or claude (saved after first choice if omitted)")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of chunks to retrieve")
     parser.add_argument("--fresh", action="store_true", help="Re-ingest docs even if vector DB exists")
     parser.add_argument("--platform", default=None, choices=list(PLATFORM_CONFIGS.keys()),
@@ -882,7 +1031,8 @@ def main():
         vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
         ingest(args.md_dir, vectordb_dir, args.embed_model, args.ingest_fresh)
     else:
-        api_key = _ensure_api_key()
+        provider = args.provider or _pick_provider()
+        api_key = _ensure_api_key(provider)
         vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
         # Resolve platform config
         platform = args.platform or detect_platform("docs/md")
@@ -890,9 +1040,10 @@ def main():
         console.print(f"[info]Platform: {platform} ({platform_cfg['sdk_name']})[/info]")
 
         if args.command == "query":
-            query(args.question, vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, platform_cfg)
+            default_model = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_MODEL
+            query(args.question, vectordb_dir, args.embed_model, provider, default_model, args.top_k, api_key, platform_cfg)
         elif args.command == "chat":
-            chat(vectordb_dir, args.embed_model, args.groq_model, args.top_k, api_key, platform_cfg)
+            chat(vectordb_dir, args.embed_model, provider, args.top_k, api_key, platform_cfg)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "RAG Chat",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["rag_agent.py", "chat"],
+      "port": null
+    },
+    {
+      "name": "RAG Ingest",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["rag_agent.py", "ingest", "docs/md"],
+      "port": null
+    },
+    {
+      "name": "Setup (HTML → MD → VectorDB)",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["setup.sh"],
+      "port": null
+    }
+  ]
+}
