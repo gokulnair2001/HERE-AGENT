@@ -25,11 +25,29 @@ hsa /path/to/your/docs
 Point it at a folder of `.html` or `.md` files. On first run it:
 1. Converts HTML to Markdown (if the folder contains `.html` files)
 2. **Auto-detects the platform** (iOS/Android/Flutter) from the docs directory name or file contents
-3. Prompts for your Groq API key (free at https://console.groq.com/keys)
+3. Prompts you to choose a provider — **Claude Code** (default, no extra key) or **Groq** (free API key)
 4. Indexes your docs into a local vector DB
 5. Starts an interactive chat with query expansion, reranking, and skill detection
 
 Subsequent runs skip steps 1–4 and go straight to chat.
+
+## LLM Providers
+
+HSA supports two providers. Your choice is saved to `~/.hsa/config.json` — you're only asked once.
+
+| Provider | How it works | Key required |
+|---|---|---|
+| **Claude Code** *(default)* | Remote-controls the `claude` CLI already running on your machine | None — reuses existing Claude Code auth |
+| **Groq** | Calls the Groq cloud API | Free key at [console.groq.com/keys](https://console.groq.com/keys) |
+
+```bash
+# Override provider for a single run
+hsa /path/to/docs --provider claude-code
+hsa /path/to/docs --provider groq
+
+# Reset saved provider/key
+rm ~/.hsa/config.json
+```
 
 ## Multi-Platform Support
 
@@ -70,10 +88,6 @@ hsa /path/to/md/docs
 
 # Force re-index after docs change
 hsa /path/to/docs --fresh
-
-# Set API key via env to skip the prompt
-export GROQ_API_KEY=gsk_your_key_here
-hsa /path/to/docs
 ```
 
 ### Subcommands (advanced)
@@ -91,12 +105,32 @@ hsa chat --platform android
 
 ## How It Works
 
-The chat uses a multi-stage retrieval pipeline:
-1. **Query expansion** — LLM generates 2-3 refined search queries from your question
-2. **Semantic search** — retrieves relevant doc chunks from the vector DB
-3. **Keyword reranking** — boosts chunks that share terms with your question
-4. **Skill detection** — auto-detects the best response format (code, comparison, troubleshooting, tutorial)
-5. **Grounded answer** — LLM answers strictly from retrieved context with source citations
+```
+You type a question
+       ↓
+LLM rephrases it into 3 diverse search queries   (query expansion)
+       ↓
+Each query searches the vector DB independently  (semantic search)
+       ↓
+Results are deduplicated and capped at ~12 chunks
+       ↓
+Chunks are sorted by keyword overlap             (reranking)
+       ↓
+Question type is detected                        (skill detection)
+       ↓
+All chunks + question sent to LLM as context     (grounded answer)
+       ↓
+LLM answers strictly from the context, with source citations
+```
+
+### Skills (auto-detected from your question)
+
+| Skill | Triggered by | Output format |
+|---|---|---|
+| 💻 **Code Generation** | "show me how to", "example of" | Self-contained code snippet |
+| ⚖️ **API Comparison** | "compare", "vs", "difference between" | Markdown table |
+| 🔧 **Troubleshooting** | "error", "not working", "crash" | Numbered causes + fixes |
+| 📖 **Tutorial** | "step by step", "how to set up" | Numbered steps with prereqs |
 
 ## Uninstall
 
@@ -109,4 +143,5 @@ Removes `~/.hsa/` (venv + script) and `~/.local/bin/hsa`.
 ## Requirements
 
 - Python 3.10+
-- Groq API key (free tier works)
+- **Claude Code** installed (for the default provider) — [claude.ai/code](https://claude.ai/code)
+- Or a **Groq API key** (free tier works) — [console.groq.com/keys](https://console.groq.com/keys)
