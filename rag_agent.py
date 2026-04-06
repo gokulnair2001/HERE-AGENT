@@ -23,8 +23,8 @@ warnings.filterwarnings("ignore", message=".*Pydantic V1.*")
 
 REQUIRED_PACKAGES = [
     "langchain-community", "langchain-text-splitters", "chromadb",
-    "sentence-transformers", "groq", "anthropic", "rich", "python-dotenv",
-    "beautifulsoup4", "markdownify",
+    "sentence-transformers", "groq",
+    "rich", "python-dotenv", "beautifulsoup4", "markdownify",
 ]
 
 HSA_HOME = Path.home() / ".hsa"
@@ -119,9 +119,12 @@ from groq import Groq
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 from rich.prompt import Prompt
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup, Comment
 from markdownify import markdownify as md_convert
@@ -223,18 +226,26 @@ def convert_html_to_md(html_dir: str, md_dir: str) -> str:
     return str(out_path)
 
 custom_theme = Theme({
-    "info": "cyan",
-    "warning": "yellow",
-    "success": "bold green",
-    "source": "dim italic",
+    "info": "bright_cyan",
+    "warning": "bold yellow",
+    "success": "bold bright_green",
+    "error": "bold red",
+    "source": "dim cyan",
     "user_prompt": "bold bright_green",
+    "muted": "dim white",
+    "model": "bold bright_yellow",
+    "provider_name": "bold bright_cyan",
+    "skill_code": "bright_cyan",
+    "skill_compare": "bright_yellow",
+    "skill_troubleshoot": "bright_red",
+    "skill_tutorial": "bright_green",
 })
 console = Console(theme=custom_theme)
 
 DEFAULT_VECTORDB_DIR = "./vectordb"
 DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_CODE_MODEL = "claude-sonnet-4-6"
 DEFAULT_TOP_K = 8
 
 AVAILABLE_MODELS = {
@@ -242,10 +253,10 @@ AVAILABLE_MODELS = {
         "llama-3.3-70b-versatile",
         "openai/gpt-oss-120b",
     ],
-    "claude": [
+    "claude-code": [
+        "claude-opus-4-6",
         "claude-sonnet-4-6",
-        "claude-opus-4-5",
-        "claude-haiku-4-5-20251001",
+        "claude-haiku-4-5",
     ],
 }
 
@@ -319,17 +330,27 @@ def get_platform_config(platform: str) -> dict:
 
 
 def _pick_provider() -> str:
-    """Ask Groq or Claude — skip if already saved in config."""
+    """Pick Claude Code or Groq — skip if already saved in config."""
     cfg = _load_config()
     saved = cfg.get("provider")
-    if saved in ("groq", "claude"):
-        console.print(f"[info]Provider: [bold]{saved}[/bold]  [dim](saved — delete ~/.hsa/config.json to reset)[/dim][/info]")
+    if saved in VALID_PROVIDERS:
+        console.print(
+            f"[muted]Provider:[/muted] [provider_name]{saved}[/provider_name]  "
+            f"[muted](saved — delete ~/.hsa/config.json to reset)[/muted]"
+        )
         return saved
-    console.print("[bold]Select LLM provider:[/bold]")
-    console.print("  [cyan]1[/cyan]. Groq    [dim](free & fast — console.groq.com)[/dim]")
-    console.print("  [cyan]2[/cyan]. Claude  [dim](Anthropic — console.anthropic.com)[/dim]")
-    choice = Prompt.ask("Enter 1 or 2", default="1").strip()
-    provider = "claude" if choice == "2" else "groq"
+
+    table = Table(box=None, show_header=False, padding=(0, 2), expand=False)
+    table.add_column("num", style="bold cyan", width=3, no_wrap=True)
+    table.add_column("name", style="bold", width=14, no_wrap=True)
+    table.add_column("desc", style="dim")
+    table.add_row("1", "Claude Code", "remote-controls the running claude CLI — no extra key  [bold green]← default[/bold green]")
+    table.add_row("2", "Groq", "free & fast · console.groq.com")
+
+    console.print()
+    console.print(Panel(table, title="[bold]Select LLM Provider[/bold]", border_style="cyan", padding=(0, 1)))
+    choice = Prompt.ask("Enter [cyan]1[/cyan] or [cyan]2[/cyan]", default="1").strip()
+    provider = "groq" if choice == "2" else "claude-code"
     _save_config({"provider": provider})
     return provider
 
@@ -337,11 +358,18 @@ def _pick_provider() -> str:
 def _pick_model(provider: str) -> str:
     """Interactive model picker — shows models for the active provider."""
     models = AVAILABLE_MODELS[provider]
-    default = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_MODEL
-    console.print(f"[bold]Select a {provider.capitalize()} model:[/bold]")
-    for i, model in enumerate(models, 1):
-        marker = " [dim](default)[/dim]" if model == default else ""
-        console.print(f"  [cyan]{i}[/cyan]. {model}{marker}")
+    default = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_CODE_MODEL
+
+    table = Table(box=None, show_header=False, padding=(0, 2), expand=False)
+    table.add_column("num", style="bold cyan", width=3, no_wrap=True)
+    table.add_column("name", width=30)
+    for i, m in enumerate(models, 1):
+        marker = "  [bold green]← default[/bold green]" if m == default else ""
+        table.add_row(str(i), f"[model]{m}[/model]{marker}")
+
+    label = provider.replace("-", " ").title()
+    console.print()
+    console.print(Panel(table, title=f"[bold]Select {label} Model[/bold]", border_style="cyan", padding=(0, 1)))
     idx_default = str(models.index(default) + 1) if default in models else "1"
     choice = Prompt.ask("Enter number or model name", default=idx_default).strip()
     if choice.isdigit() and 1 <= int(choice) <= len(models):
@@ -351,7 +379,7 @@ def _pick_model(provider: str) -> str:
     else:
         matches = [m for m in models if choice.lower() in m.lower()]
         selected = matches[0] if matches else default
-    console.print(f"Using model: [cyan]{selected}[/cyan]\n")
+    console.print(f"[muted]Using model:[/muted] [model]{selected}[/model]\n")
     return selected
 
 SYSTEM_PROMPT = """\
@@ -548,40 +576,57 @@ def ingest(md_dir: str, vectordb_dir: str, embed_model: str, fresh: bool = False
     )
 
     all_chunks = []
-    for doc in docs:
-        source_file = Path(doc.metadata.get("source", "unknown"))
-        class_name = source_file.stem  # e.g., "MapView" from "MapView.md"
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[bright_cyan]{task.completed}/{task.total}[/bright_cyan]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("[info]Chunking documents...[/info]", total=len(docs))
+        for doc in docs:
+            source_file = Path(doc.metadata.get("source", "unknown"))
+            class_name = source_file.stem  # e.g., "MapView" from "MapView.md"
 
-        # Split by headers
-        header_chunks = header_splitter.split_text(doc.page_content)
-        for chunk in header_chunks:
-            # Carry source metadata
-            chunk.metadata["source"] = doc.metadata.get("source", "unknown")
-            chunk.metadata["class_name"] = class_name
-        # Further split any large chunks
-        final_chunks = text_splitter.split_documents(header_chunks)
+            # Split by headers
+            header_chunks = header_splitter.split_text(doc.page_content)
+            for chunk in header_chunks:
+                # Carry source metadata
+                chunk.metadata["source"] = doc.metadata.get("source", "unknown")
+                chunk.metadata["class_name"] = class_name
+            # Further split any large chunks
+            final_chunks = text_splitter.split_documents(header_chunks)
 
-        # Prepend class name to each chunk for better embedding alignment
-        for chunk in final_chunks:
-            chunk.page_content = f"[Class: {class_name}] {chunk.page_content}"
-            chunk.metadata["class_name"] = class_name
+            # Prepend class name to each chunk for better embedding alignment
+            for chunk in final_chunks:
+                chunk.page_content = f"[Class: {class_name}] {chunk.page_content}"
+                chunk.metadata["class_name"] = class_name
 
-        all_chunks.extend(final_chunks)
+            all_chunks.extend(final_chunks)
+            progress.advance(task)
 
-    console.print(f"[info]Created {len(all_chunks)} chunk(s)[/info]")
+    console.print(f"[success]✓[/success] Created [bright_cyan]{len(all_chunks)}[/bright_cyan] chunks from [bright_cyan]{len(docs)}[/bright_cyan] documents")
 
     # Embed and store
-    console.print(f"[info]Embedding with model '{embed_model}' (first run downloads the model)...[/info]")
-    embeddings = get_embeddings(embed_model)
+    with console.status(f"[info]Embedding with '[model]{embed_model}[/model]' (first run downloads the model)...[/info]", spinner="dots"):
+        embeddings = get_embeddings(embed_model)
+        vectorstore = Chroma.from_documents(
+            documents=all_chunks,
+            embedding=embeddings,
+            persist_directory=vectordb_dir,
+        )
 
-    vectorstore = Chroma.from_documents(
-        documents=all_chunks,
-        embedding=embeddings,
-        persist_directory=vectordb_dir,
-    )
-
-    console.print(f"[success]Stored {len(all_chunks)} vectors in {vectordb_dir}[/success]")
-    console.print('[success]Ingestion complete.[/success] Run: [bold]python rag_agent.py chat[/bold]')
+    console.print(f"[success]✓[/success] Stored [bright_cyan]{len(all_chunks)}[/bright_cyan] vectors → [muted]{vectordb_dir}[/muted]")
+    console.print()
+    console.print(Rule(style="bright_green"))
+    console.print(Panel(
+        "[success]Ingestion complete![/success]\n\n"
+        "  [muted]Start chatting:[/muted]\n"
+        "    [bold]python rag_agent.py chat[/bold]",
+        border_style="bright_green", padding=(0, 2),
+    ))
 
 
 def get_retriever(vectordb_dir: str, embed_model: str, top_k: int):
@@ -667,18 +712,26 @@ SKILL_LABELS = {
     "tutorial": "\U0001f4d6 Tutorial",
 }
 
+_SKILL_BORDER = {
+    "code": "bright_cyan",
+    "compare": "bright_yellow",
+    "troubleshoot": "bright_red",
+    "tutorial": "bright_green",
+}
+
 
 def print_answer(answer: str, docs, skill_name: str = None) -> None:
     """Render the answer as formatted markdown with source citations."""
+    border = _SKILL_BORDER.get(skill_name, "bright_cyan")
     title = "[bold bright_white]Answer[/bold bright_white]"
     if skill_name and skill_name in SKILL_LABELS:
-        title += f"  [dim]({SKILL_LABELS[skill_name]})[/dim]"
+        title += f"  [bold {border}]({SKILL_LABELS[skill_name]})[/bold {border}]"
 
     console.print()
     console.print(Panel(
         Markdown(answer),
         title=title,
-        border_style="bright_cyan",
+        border_style=border,
         padding=(1, 2),
     ))
 
@@ -690,9 +743,10 @@ def print_answer(answer: str, docs, skill_name: str = None) -> None:
             if source not in seen:
                 seen.add(source)
                 sources.append(Path(source).stem)
-        source_text = "  ".join(f"[source]• {s}[/source]" for s in sources)
-        console.print(f"  [dim]Sources:[/dim] {source_text}")
+        chips = "  ".join(f"[source]▸ {s}[/source]" for s in sources)
+        console.print(f"  [muted]Sources:[/muted]  {chips}")
     console.print()
+    console.print(Rule(style="dim"))
 
 
 def query(question: str, vectordb_dir: str, embed_model: str, provider: str, model: str, top_k: int, api_key: str, platform_cfg: dict = None) -> None:
@@ -726,18 +780,33 @@ def chat(vectordb_dir: str, embed_model: str, provider: str, top_k: int, api_key
 
     model = _pick_model(provider)
 
+    # Header panel
+    label = provider.replace("-", " ").title()
     console.print(Panel(
-        f"[bold]{cfg['sdk_name']} Documentation Agent[/bold]\n\n"
-        f"Platform: [cyan]{cfg['language']}[/cyan] | Model: [cyan]{model}[/cyan] via [cyan]{provider.capitalize()}[/cyan]\n\n"
-        f"[bold]Skills[/bold] (auto-detected from your question):\n"
-        f"  \U0001f4bb [bold]Code Generation[/bold]  — \"Show me how to...\", \"example of...\"\n"
-        f"  \u2696\ufe0f  [bold]API Comparison[/bold]   — \"Compare X vs Y\", \"difference between...\"\n"
-        f"  \U0001f527 [bold]Troubleshooting[/bold]  — \"Error with...\", \"not working...\"\n"
-        f"  \U0001f4d6 [bold]Tutorial[/bold]         — \"Step by step...\", \"how to set up...\"\n\n"
-        f"Type your question and press Enter.\n"
-        f"Commands: [bold]quit[/bold] / [bold]exit[/bold] / [bold]q[/bold] to leave.",
+        f"[bold bright_white]{cfg['sdk_name']} Documentation Agent[/bold bright_white]\n\n"
+        f"[muted]Platform[/muted] [cyan]{cfg['language']}[/cyan]   "
+        f"[muted]Model[/muted] [model]{model}[/model]   "
+        f"[muted]via[/muted] [provider_name]{label}[/provider_name]",
         border_style="bright_green",
         padding=(1, 2),
+    ))
+
+    # Skills reference panel
+    skill_table = Table(box=None, show_header=False, padding=(0, 2), expand=False)
+    skill_table.add_column("icon", width=4, no_wrap=True)
+    skill_table.add_column("skill", style="bold", width=18, no_wrap=True)
+    skill_table.add_column("example", style="dim")
+    skill_table.add_row("\U0001f4bb", "[skill_code]Code Generation[/skill_code]", '"Show me how to..."  "example of..."')
+    skill_table.add_row("\u2696\ufe0f ", "[skill_compare]API Comparison[/skill_compare]", '"Compare X vs Y"  "difference between..."')
+    skill_table.add_row("\U0001f527", "[skill_troubleshoot]Troubleshooting[/skill_troubleshoot]", '"Error with..."  "not working..."')
+    skill_table.add_row("\U0001f4d6", "[skill_tutorial]Tutorial[/skill_tutorial]", '"Step by step..."  "how to set up..."')
+
+    console.print(Panel(
+        skill_table,
+        title="[bold]Skills[/bold] [dim](auto-detected)[/dim]",
+        subtitle="[dim]quit / exit / q to leave[/dim]",
+        border_style="dim green",
+        padding=(0, 1),
     ))
     console.print()
 
@@ -755,7 +824,7 @@ def chat(vectordb_dir: str, embed_model: str, provider: str, top_k: int, api_key
             break
 
         answer = skill_name = None
-        with console.status("[info]Thinking...[/info]", spinner="dots"):
+        with console.status("[info]Searching knowledge base and generating answer...[/info]", spinner="dots2"):
             docs = retrieve_with_expansion(vectorstore, top_k, question, api_key, provider, model, cfg)
             docs = rerank_docs(docs, question)
             try:
@@ -780,9 +849,11 @@ def _vectordb_dir_for(md_dir: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(md_dir)), ".vectordb_" + Path(md_dir).name)
 
 
+VALID_PROVIDERS = ("groq", "claude-code")
+
 _PROVIDER_META = {
-    "groq":   {"env": "GROQ_API_KEY",      "cfg_key": "groq_api_key",      "url": "https://console.groq.com/keys"},
-    "claude": {"env": "ANTHROPIC_API_KEY",  "cfg_key": "anthropic_api_key", "url": "https://console.anthropic.com/keys"},
+    "groq":        {"env": "GROQ_API_KEY", "cfg_key": "groq_api_key", "url": "https://console.groq.com/keys"},
+    "claude-code": {"env": None,           "cfg_key": None,           "url": None},
 }
 
 
@@ -790,8 +861,11 @@ def _ensure_api_key(provider: str) -> str:
     """Return the API key for the given provider.
 
     Priority: env var → saved config → prompt user (then save).
+    claude-code needs no key — it reuses Claude Code's existing auth.
     """
     meta = _PROVIDER_META[provider]
+    if meta["env"] is None:
+        return ""   # claude-code: no API key needed
     # 1. Environment variable
     key = os.environ.get(meta["env"])
     if key:
@@ -831,18 +905,42 @@ def call_llm(messages: list, provider: str, model: str, api_key: str, **kwargs) 
         client = Groq(api_key=api_key)
         resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
         return resp.choices[0].message.content
-    elif provider == "claude":
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=api_key)
-        system_msg = next((m["content"] for m in messages if m["role"] == "system"), "")
-        user_msgs = [m for m in messages if m["role"] != "system"]
-        resp = client.messages.create(
-            model=model,
-            max_tokens=kwargs.get("max_tokens", 2048),
-            system=system_msg,
-            messages=user_msgs,
+    elif provider == "claude-code":
+        import subprocess
+
+        # All our prompts are single user messages — pull the last one
+        prompt_text = next(
+            (m["content"] for m in reversed(messages) if m["role"] == "user"),
+            messages[-1]["content"],
         )
-        return resp.content[0].text
+
+        # Locate the claude binary: check PATH first, then common install locations
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            for candidate in [
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                str(Path.home() / ".local" / "bin" / "claude"),
+            ]:
+                if Path(candidate).exists():
+                    claude_bin = candidate
+                    break
+        if not claude_bin:
+            raise RuntimeError(
+                "claude CLI not found. Make sure Claude Code is installed "
+                "and `claude` is on your PATH."
+            )
+
+        cmd = [claude_bin, "--print", prompt_text]
+        if model:
+            cmd += ["--model", model]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"claude CLI exited {result.returncode}: {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -932,7 +1030,7 @@ def main():
         quick_parser.add_argument("docs_path", help="Path to directory of .html or .md files.")
         quick_parser.add_argument("--vectordb", default=None)
         quick_parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
-        quick_parser.add_argument("--provider", default=None, choices=["groq", "claude"],
+        quick_parser.add_argument("--provider", default=None, choices=list(VALID_PROVIDERS),
                                   help="LLM provider (saved after first choice if omitted)")
         quick_parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
         quick_parser.add_argument("--fresh", action="store_true")
@@ -987,8 +1085,8 @@ def main():
     parser.add_argument("--uninstall", action="store_true", help=f"Remove '{CLI_NAME}' CLI command")
     parser.add_argument("--vectordb", default=None, help="Path to ChromaDB directory (auto-derived if omitted)")
     parser.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL, help="Sentence-transformers model name")
-    parser.add_argument("--provider", default=None, choices=["groq", "claude"],
-                        help="LLM provider: groq or claude (saved after first choice if omitted)")
+    parser.add_argument("--provider", default=None, choices=list(VALID_PROVIDERS),
+                        help="LLM provider: claude-code (default) or groq (saved after first choice if omitted)")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of chunks to retrieve")
     parser.add_argument("--fresh", action="store_true", help="Re-ingest docs even if vector DB exists")
     parser.add_argument("--platform", default=None, choices=list(PLATFORM_CONFIGS.keys()),
@@ -1040,7 +1138,7 @@ def main():
         console.print(f"[info]Platform: {platform} ({platform_cfg['sdk_name']})[/info]")
 
         if args.command == "query":
-            default_model = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_MODEL
+            default_model = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_CLAUDE_CODE_MODEL
             query(args.question, vectordb_dir, args.embed_model, provider, default_model, args.top_k, api_key, platform_cfg)
         elif args.command == "chat":
             chat(vectordb_dir, args.embed_model, provider, args.top_k, api_key, platform_cfg)
