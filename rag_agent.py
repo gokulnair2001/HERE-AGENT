@@ -974,7 +974,8 @@ def _install_cli():
 
     # Copy the script to ~/.hsa/ so it's self-contained
     installed_script = HSA_HOME / "rag_agent.py"
-    shutil.copy2(script_path, installed_script)
+    if os.path.abspath(script_path) != os.path.abspath(installed_script):
+        shutil.copy2(script_path, installed_script)
 
     # Write a wrapper shell script that uses the venv python
     wrapper_content = f"""#!/bin/sh
