@@ -439,7 +439,7 @@ SKILLS = {
         "keywords": ["compare", "difference", "vs", "versus", "differ", "which one", "better", "alternative", "instead of"],
         "instructions": (
             "SKILL: API Comparison\n"
-            "- Present a Markdown table: Feature | {first} | {second} (derive names from the question).\n"
+            "- Present a Markdown table: Feature | {{first}} | {{second}} (derive names from the question).\n"
             "- Populate cells ONLY with information found in the context; write '—' where context is silent.\n"
             "- Highlight differences in purpose, key methods, parameters, and return types.\n"
             "- If the context only covers one of the two items, say so clearly before the table.\n"
