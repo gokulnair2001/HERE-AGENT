@@ -132,6 +132,62 @@ LLM answers strictly from the context, with source citations
 | 🔧 **Troubleshooting** | "error", "not working", "crash" | Numbered causes + fixes |
 | 📖 **Tutorial** | "step by step", "how to set up" | Numbered steps with prereqs |
 
+## MCP Server — Use with Claude Code
+
+You can connect HSA to Claude Code as an **MCP server** so Claude Code can search your HERE SDK docs directly while you're working on any project. The normal CLI (`hsa chat`, `hsa query`) continues to work as before.
+
+### Step 1: Ingest your docs (if not done already)
+
+```bash
+hsa /path/to/your/docs
+# Or just ingest without chatting:
+hsa ingest /path/to/md/docs
+```
+
+Note the vector DB path printed during ingestion (e.g. `/path/to/.vectordb_md`).
+
+### Step 2: Add to your project's Claude Code settings
+
+In your **app project** (not the HSA repo), create or edit `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "here-sdk-docs": {
+      "command": "/Users/YOUR_USERNAME/.local/bin/hsa",
+      "args": ["mcp-serve", "--vectordb", "/path/to/.vectordb_md"]
+    }
+  }
+}
+```
+
+Replace the paths:
+- **command** — path to the `hsa` binary (`which hsa` to find it)
+- **--vectordb** — path to the vector DB created during ingestion
+
+### Step 3: Use it
+
+Open Claude Code in your app project. Claude Code now has two extra tools:
+
+| Tool | What it does |
+|---|---|
+| `search_here_docs(query)` | Searches the indexed docs and returns matching chunks with source attribution |
+| `list_indexed_classes()` | Lists all API classes/files in the index |
+
+When you ask Claude Code a question about the HERE SDK, it will automatically call these tools to fetch the relevant docs and use them in its response — while also being able to edit your code directly.
+
+### Example
+
+```
+You (in Claude Code, working on your iOS app):
+> "Add MapView with a custom map style to my ViewController"
+
+Claude Code:
+  1. Calls search_here_docs("MapView custom map style initialization")
+  2. Gets back relevant doc chunks about MapView, MapScheme, loadScene
+  3. Writes the actual Swift code in your ViewController.swift
+```
+
 ## Uninstall
 
 ```bash
