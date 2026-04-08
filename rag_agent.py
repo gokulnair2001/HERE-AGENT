@@ -112,25 +112,32 @@ else:
             stdout=subprocess.DEVNULL,
         )
 
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from groq import Groq
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.rule import Rule
-from rich.table import Table
-from rich.text import Text
-from rich.theme import Theme
-from rich.prompt import Prompt
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-from dotenv import load_dotenv
-from bs4 import BeautifulSoup, Comment
-from markdownify import markdownify as md_convert
+# ---------------------------------------------------------------------------
+# Fast-path: mcp-serve needs minimal imports for instant MCP handshake.
+# Defer heavy deps (langchain, sentence-transformers, groq, bs4) until needed.
+# ---------------------------------------------------------------------------
+_MCP_SERVE_MODE = (len(sys.argv) > 1 and sys.argv[1] == "mcp-serve")
 
-load_dotenv()
+if not _MCP_SERVE_MODE:
+    from langchain_community.document_loaders import DirectoryLoader, TextLoader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+    from langchain_community.vectorstores import Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from groq import Groq
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.text import Text
+    from rich.theme import Theme
+    from rich.prompt import Prompt
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+    from dotenv import load_dotenv
+    from bs4 import BeautifulSoup, Comment
+    from markdownify import markdownify as md_convert
+
+    load_dotenv()
 
 # ---------------------------------------------------------------------------
 # HTML → Markdown conversion
@@ -630,8 +637,9 @@ def ingest(md_dir: str, vectordb_dir: str, embed_model: str, fresh: bool = False
         "[success]Ingestion complete![/success]\n\n"
         "  [muted]Start chatting:[/muted]\n"
         "    [bold]hsa chat[/bold]\n\n"
-        "  [muted]Connect to Claude Code (one-time):[/muted]\n"
-        "    [bold]claude mcp add --scope user here-sdk-docs -- hsa mcp-serve[/bold]",
+        "  [muted]Connect to Claude Code:[/muted]\n"
+        "    [bold]Terminal 1:[/bold] hsa mcp-serve\n"
+        "    [bold]Terminal 2:[/bold] claude mcp add --transport sse here-sdk-docs http://localhost:8765/sse",
         border_style="bright_green", padding=(0, 2),
     ))
 
@@ -881,15 +889,25 @@ def _discover_vectordb(vectordb_dir: str | None) -> str:
     )
 
 
-def mcp_serve(vectordb_dir: str | None, embed_model: str, top_k: int) -> None:
-    """Run an MCP server that exposes HERE SDK doc search to Claude Code."""
+MCP_DEFAULT_PORT = 8765
+
+
+def mcp_serve(vectordb_dir: str | None, embed_model: str, top_k: int, port: int = MCP_DEFAULT_PORT) -> None:
+    """Run an MCP server over SSE that exposes HERE SDK doc search to Claude Code.
+
+    The server loads the embedding model and vector DB at startup, then
+    listens on http://localhost:<port>/sse. Claude Code connects to it.
+    """
+    from langchain_community.vectorstores import Chroma as _Chroma
+    from langchain_community.embeddings import HuggingFaceEmbeddings as _HFE
     from mcp.server.fastmcp import FastMCP
 
     vectordb_dir = _discover_vectordb(vectordb_dir)
 
-    # Load vector store once at startup
-    embeddings = get_embeddings(embed_model)
-    vectorstore = Chroma(
+    print(f"Loading embedding model '{embed_model}'...")
+    embeddings = _HFE(model_name=embed_model, model_kwargs={"device": "cpu"})
+    print(f"Loading vector DB from {vectordb_dir}...")
+    vectorstore = _Chroma(
         persist_directory=vectordb_dir,
         embedding_function=embeddings,
     )
@@ -901,6 +919,7 @@ def mcp_serve(vectordb_dir: str | None, embed_model: str, top_k: int) -> None:
             "API references, code examples, and usage guides. Call it multiple "
             "times with different phrasings for better coverage."
         ),
+        port=port,
     )
 
     @server.tool()
@@ -960,7 +979,11 @@ def mcp_serve(vectordb_dir: str | None, embed_model: str, top_k: int) -> None:
             + "\n".join(f"  - {name}" for name in class_names)
         )
 
-    server.run(transport="stdio")
+    print(f"\n✅ MCP server ready on http://localhost:{port}/sse")
+    print(f"\nConnect to Claude Code (one-time):")
+    print(f"  claude mcp add --transport sse here-sdk-docs http://localhost:{port}/sse")
+    print(f"\nPress Ctrl+C to stop.\n")
+    server.run(transport="sse")
 
 
 
@@ -1230,7 +1253,8 @@ def main():
     subparsers.add_parser("chat", help="Interactive chat mode (single-shot retrieval)")
 
     # mcp-serve
-    subparsers.add_parser("mcp-serve", help="Run as MCP server (for Claude Code integration)")
+    mcp_parser = subparsers.add_parser("mcp-serve", help="Run as MCP server (for Claude Code integration)")
+    mcp_parser.add_argument("--port", type=int, default=MCP_DEFAULT_PORT, help=f"Port to listen on (default: {MCP_DEFAULT_PORT})")
 
     args = parser.parse_args()
 
@@ -1256,7 +1280,7 @@ def main():
         ingest(args.md_dir, vectordb_dir, args.embed_model, args.ingest_fresh)
     elif args.command == "mcp-serve":
         vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
-        mcp_serve(vectordb_dir, args.embed_model, args.top_k)
+        mcp_serve(vectordb_dir, args.embed_model, args.top_k, args.port)
     else:
         provider = args.provider or _pick_provider()
         api_key = _ensure_api_key(provider)
