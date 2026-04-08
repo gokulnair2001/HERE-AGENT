@@ -25,6 +25,7 @@ REQUIRED_PACKAGES = [
     "langchain-community", "langchain-text-splitters", "chromadb",
     "sentence-transformers", "groq",
     "rich", "python-dotenv", "beautifulsoup4", "markdownify",
+    "mcp",
 ]
 
 HSA_HOME = Path.home() / ".hsa"
@@ -842,6 +843,93 @@ def chat(vectordb_dir: str, embed_model: str, provider: str, top_k: int, api_key
         print_answer(answer, docs, skill_name)
 
 
+# ---------------------------------------------------------------------------
+# MCP Server — expose the vector DB as tools for Claude Code
+# ---------------------------------------------------------------------------
+
+def mcp_serve(vectordb_dir: str, embed_model: str, top_k: int) -> None:
+    """Run an MCP server that exposes HERE SDK doc search to Claude Code."""
+    from mcp.server.fastmcp import FastMCP
+
+    if not Path(vectordb_dir).is_dir():
+        sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
+
+    # Load vector store once at startup
+    embeddings = get_embeddings(embed_model)
+    vectorstore = Chroma(
+        persist_directory=vectordb_dir,
+        embedding_function=embeddings,
+    )
+
+    server = FastMCP(
+        "here-sdk-docs",
+        instructions=(
+            "Search HERE SDK documentation. Use search_here_docs to find "
+            "API references, code examples, and usage guides. Call it multiple "
+            "times with different phrasings for better coverage."
+        ),
+    )
+
+    @server.tool()
+    def search_here_docs(query: str, num_results: int = 8) -> str:
+        """Search the indexed HERE SDK documentation.
+
+        Args:
+            query: Natural language search query (e.g. "MapView initialization",
+                   "routing engine calculate route", "camera behavior types").
+                   Tip: search for class names, method names, or concepts separately
+                   for best results.
+            num_results: Number of document chunks to return (default 8, max 20).
+
+        Returns:
+            Matching documentation chunks with source file attribution.
+            Each chunk is prefixed with its source class/file name.
+        """
+        k = min(max(num_results, 1), 20)
+        retriever = vectorstore.as_retriever(
+            search_type="similarity", search_kwargs={"k": k}
+        )
+        docs = retriever.invoke(query)
+        docs = rerank_docs(docs, query)
+
+        if not docs:
+            return "No matching documentation found. Try different search terms."
+
+        parts = []
+        for i, doc in enumerate(docs, 1):
+            source = Path(doc.metadata.get("source", "unknown")).stem
+            class_name = doc.metadata.get("class_name", source)
+            parts.append(
+                f"--- Chunk {i} [Source: {source}, Class: {class_name}] ---\n"
+                f"{doc.page_content}"
+            )
+        return "\n\n".join(parts)
+
+    @server.tool()
+    def list_indexed_classes() -> str:
+        """List all class/file names indexed in the HERE SDK documentation.
+
+        Use this to discover what APIs and classes are available before
+        searching for specific details. Returns a sorted list of all
+        unique class names in the vector database.
+        """
+        collection = vectorstore._collection
+        all_meta = collection.get(include=["metadatas"])
+        class_names = sorted({
+            m.get("class_name", "unknown")
+            for m in all_meta["metadatas"]
+            if m.get("class_name")
+        })
+        if not class_names:
+            return "No classes found. The vector DB may be empty."
+        return (
+            f"Indexed {len(class_names)} classes/files:\n\n"
+            + "\n".join(f"  - {name}" for name in class_names)
+        )
+
+    server.run(transport="stdio")
+
+
 
 
 def _vectordb_dir_for(md_dir: str) -> str:
@@ -1022,7 +1110,7 @@ def main():
     # Quick-start: detect if first arg is a path (not a subcommand or flag)
     # Must happen before argparse since subparsers would eat it.
     # ------------------------------------------------------------------
-    SUBCOMMANDS = {"ingest", "query", "chat"}
+    SUBCOMMANDS = {"ingest", "query", "chat", "mcp-serve"}
     first_arg = sys.argv[1] if len(sys.argv) > 1 else None
 
     if first_arg and not first_arg.startswith("-") and first_arg not in SUBCOMMANDS and os.path.isdir(first_arg):
@@ -1080,7 +1168,7 @@ def main():
     # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(
         description="RAG Agent — chat with your docs",
-        usage="%(prog)s [docs_path] [options]\n       %(prog)s {ingest,query,chat,agent} ...",
+        usage="%(prog)s [docs_path] [options]\n       %(prog)s {ingest,query,chat,mcp-serve} ...",
     )
     parser.add_argument("--install", action="store_true", help=f"Install as '{CLI_NAME}' CLI command")
     parser.add_argument("--uninstall", action="store_true", help=f"Remove '{CLI_NAME}' CLI command")
@@ -1107,6 +1195,9 @@ def main():
     # chat
     subparsers.add_parser("chat", help="Interactive chat mode (single-shot retrieval)")
 
+    # mcp-serve
+    subparsers.add_parser("mcp-serve", help="Run as MCP server (for Claude Code integration)")
+
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1129,6 +1220,9 @@ def main():
     if args.command == "ingest":
         vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
         ingest(args.md_dir, vectordb_dir, args.embed_model, args.ingest_fresh)
+    elif args.command == "mcp-serve":
+        vectordb_dir = args.vectordb or DEFAULT_VECTORDB_DIR
+        mcp_serve(vectordb_dir, args.embed_model, args.top_k)
     else:
         provider = args.provider or _pick_provider()
         api_key = _ensure_api_key(provider)
