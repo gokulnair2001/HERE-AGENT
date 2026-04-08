@@ -140,30 +140,17 @@ You can connect HSA to Claude Code as an **MCP server** so Claude Code can searc
 
 ```bash
 hsa /path/to/your/docs
-# Or just ingest without chatting:
-hsa ingest /path/to/md/docs
 ```
 
-Note the vector DB path printed during ingestion (e.g. `/path/to/.vectordb_md`).
+The vector DB is stored automatically at `~/.hsa/vectordbs/<name>`.
 
-### Step 2: Add to your project's Claude Code settings
+### Step 2: Connect to Claude Code (one-time)
 
-In your **app project** (not the HSA repo), create or edit `.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "here-sdk-docs": {
-      "command": "/Users/YOUR_USERNAME/.local/bin/hsa",
-      "args": ["mcp-serve", "--vectordb", "/path/to/.vectordb_md"]
-    }
-  }
-}
+```bash
+claude mcp add --scope user here-sdk-docs -- hsa mcp-serve
 ```
 
-Replace the paths:
-- **command** — path to the `hsa` binary (`which hsa` to find it)
-- **--vectordb** — path to the vector DB created during ingestion
+That's it. `--scope user` makes it available in all your projects. The MCP server auto-discovers the vector DB from `~/.hsa/vectordbs/`.
 
 ### Step 3: Use it
 

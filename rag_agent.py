@@ -243,7 +243,8 @@ custom_theme = Theme({
 })
 console = Console(theme=custom_theme)
 
-DEFAULT_VECTORDB_DIR = "./vectordb"
+HSA_VECTORDBS = HSA_HOME / "vectordbs"
+DEFAULT_VECTORDB_DIR = str(HSA_VECTORDBS / "default")
 DEFAULT_EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_CLAUDE_CODE_MODEL = "claude-sonnet-4-6"
@@ -537,6 +538,9 @@ def get_embeddings(model_name: str = DEFAULT_EMBED_MODEL) -> HuggingFaceEmbeddin
 
 def ingest(md_dir: str, vectordb_dir: str, embed_model: str, fresh: bool = False) -> None:
     """Load .md files, chunk them, embed, and store in ChromaDB."""
+    # Ensure parent dir exists (e.g. ~/.hsa/vectordbs/)
+    Path(vectordb_dir).parent.mkdir(parents=True, exist_ok=True)
+
     if fresh and Path(vectordb_dir).exists():
         import shutil as _shutil
         _shutil.rmtree(vectordb_dir)
@@ -625,7 +629,9 @@ def ingest(md_dir: str, vectordb_dir: str, embed_model: str, fresh: bool = False
     console.print(Panel(
         "[success]Ingestion complete![/success]\n\n"
         "  [muted]Start chatting:[/muted]\n"
-        "    [bold]python rag_agent.py chat[/bold]",
+        "    [bold]hsa chat[/bold]\n\n"
+        "  [muted]Connect to Claude Code (one-time):[/muted]\n"
+        "    [bold]claude mcp add --scope user here-sdk-docs -- hsa mcp-serve[/bold]",
         border_style="bright_green", padding=(0, 2),
     ))
 
@@ -847,12 +853,39 @@ def chat(vectordb_dir: str, embed_model: str, provider: str, top_k: int, api_key
 # MCP Server — expose the vector DB as tools for Claude Code
 # ---------------------------------------------------------------------------
 
-def mcp_serve(vectordb_dir: str, embed_model: str, top_k: int) -> None:
+def _discover_vectordb(vectordb_dir: str | None) -> str:
+    """Find the vector DB: use explicit path, or auto-discover from ~/.hsa/vectordbs/."""
+    if vectordb_dir and Path(vectordb_dir).is_dir():
+        return vectordb_dir
+
+    # Auto-discover: pick the first (or only) DB in ~/.hsa/vectordbs/
+    if HSA_VECTORDBS.is_dir():
+        dbs = sorted(
+            [d for d in HSA_VECTORDBS.iterdir() if d.is_dir()],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,  # most recently modified first
+        )
+        if len(dbs) == 1:
+            return str(dbs[0])
+        if len(dbs) > 1:
+            # Multiple DBs — list them and exit
+            db_list = "\n".join(f"  - {d.name}  ({d})" for d in dbs)
+            sys.exit(
+                f"Multiple vector DBs found in {HSA_VECTORDBS}:\n{db_list}\n\n"
+                f"Specify which one: hsa mcp-serve --vectordb {dbs[0]}"
+            )
+
+    sys.exit(
+        f"No vector DB found. Run 'hsa /path/to/docs' first to ingest your documentation.\n"
+        f"Expected location: {HSA_VECTORDBS}/"
+    )
+
+
+def mcp_serve(vectordb_dir: str | None, embed_model: str, top_k: int) -> None:
     """Run an MCP server that exposes HERE SDK doc search to Claude Code."""
     from mcp.server.fastmcp import FastMCP
 
-    if not Path(vectordb_dir).is_dir():
-        sys.exit(f"Vector DB not found at '{vectordb_dir}'. Run 'ingest' first.")
+    vectordb_dir = _discover_vectordb(vectordb_dir)
 
     # Load vector store once at startup
     embeddings = get_embeddings(embed_model)
@@ -933,8 +966,9 @@ def mcp_serve(vectordb_dir: str, embed_model: str, top_k: int) -> None:
 
 
 def _vectordb_dir_for(md_dir: str) -> str:
-    """Derive a vectordb path from the docs directory so each doc set gets its own DB."""
-    return os.path.join(os.path.dirname(os.path.abspath(md_dir)), ".vectordb_" + Path(md_dir).name)
+    """Derive a vectordb path inside ~/.hsa/vectordbs/ so all DBs are in one known place."""
+    name = Path(md_dir).name.replace(" ", "_").lower()
+    return str(HSA_VECTORDBS / name)
 
 
 VALID_PROVIDERS = ("groq", "claude-code")
