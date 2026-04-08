@@ -144,15 +144,27 @@ hsa /path/to/your/docs
 
 The vector DB is stored automatically at `~/.hsa/vectordbs/<name>`.
 
-### Step 2: Connect to Claude Code (one-time)
+### Step 2: Start the MCP server
+
+In a terminal tab, run:
 
 ```bash
-claude mcp add --scope user here-sdk-docs -- hsa mcp-serve
+hsa mcp-serve
 ```
 
-That's it. `--scope user` makes it available in all your projects. The MCP server auto-discovers the vector DB from `~/.hsa/vectordbs/`.
+It loads the embedding model and vector DB, then prints `✅ MCP server ready` when it's listening. Keep this terminal open.
 
-### Step 3: Use it
+### Step 3: Connect to Claude Code (one-time)
+
+In a second terminal:
+
+```bash
+claude mcp add --transport sse here-sdk-docs http://localhost:8765/sse
+```
+
+This tells Claude Code to connect to your running HSA server. You only need to do this once.
+
+### Step 4: Use it
 
 Open Claude Code in your app project. Claude Code now has two extra tools:
 
