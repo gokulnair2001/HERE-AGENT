@@ -113,9 +113,20 @@ else:
         )
 
 # ---------------------------------------------------------------------------
-# Fast-path: mcp-serve needs minimal imports for instant MCP handshake.
-# Defer heavy deps (langchain, sentence-transformers, groq, bs4) until needed.
+# Imports: Rich (lightweight) loads always. Heavy ML deps (langchain,
+# sentence-transformers, groq, bs4) are deferred in mcp-serve mode so the
+# MCP handshake completes instantly.
 # ---------------------------------------------------------------------------
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+from rich.prompt import Prompt
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+
 _MCP_SERVE_MODE = (len(sys.argv) > 1 and sys.argv[1] == "mcp-serve")
 
 if not _MCP_SERVE_MODE:
@@ -124,15 +135,6 @@ if not _MCP_SERVE_MODE:
     from langchain_community.vectorstores import Chroma
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from groq import Groq
-    from rich.console import Console
-    from rich.markdown import Markdown
-    from rich.panel import Panel
-    from rich.rule import Rule
-    from rich.table import Table
-    from rich.text import Text
-    from rich.theme import Theme
-    from rich.prompt import Prompt
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
     from dotenv import load_dotenv
     from bs4 import BeautifulSoup, Comment
     from markdownify import markdownify as md_convert
